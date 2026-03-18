@@ -2,10 +2,12 @@
 Epoch evaluation functions
 """
 import os
+import matplotlib
+matplotlib.use('Agg')  # must be before ANY pyplot import
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
 from activations import visualize_activations
 from network import save_checkpoint
 from train import test_model

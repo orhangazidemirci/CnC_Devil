@@ -378,7 +378,7 @@ def train_spurious_model(train_loader, args, resample=False,
             return net, outputs, (train_loader_new, train_loader_spurious)
         return net, outputs, None
     
-def train_batch_model(train_loader, sliced_data_indices, args,
+def train_batch_model(train_loaders, sliced_data_indices, args,
                       val_loader, test_loader=None):
     """
     Train a single model with minibatch SGD aggregating and shuffling the sliced data indices - Updated with val loader

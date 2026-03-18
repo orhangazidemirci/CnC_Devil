@@ -86,6 +86,13 @@ def compute_slice_indices_by_rep(bias_models, dataloaders,
             bias_models[data_idx], dataloader, args, data_idx)
     
         # Per-sample best unseen model
+
+        dataset = dataloader.dataset
+        if hasattr(dataset, 'indices'):
+            targets = get_targets_all(dataset)['target'][dataset.indices]
+        else:
+            targets = get_targets_all(dataset)['target']
+
         n_samples = len(targets)
         best_model_per_sample = np.full(n_samples, -1)
         
@@ -206,7 +213,7 @@ def compute_slice_indices_by_rep(bias_models, dataloaders,
                     os.makedirs(os.path.dirname(fpath), exist_ok=True)
                     plt.savefig(fname=fpath, dpi=300, bbox_inches='tight')
                     print(f'Saved UMAP ({space_name}, {target_type}) to {fpath}!')
-            plt.close()
+                    plt.close()
     
     return sliced_data_indices, sliced_data_correct, sliced_data_losses
 

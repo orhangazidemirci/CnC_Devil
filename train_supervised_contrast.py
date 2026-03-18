@@ -262,13 +262,13 @@ def train_epoch(encoder, classifier, dataloader,
     return encoder, classifier, epoch_losses
 
 
-def compute_slice_outputs(erm_models, train_loader, test_criterion, args):
+def compute_slice_outputs(erm_models, train_loaders, test_criterion, args):
     """
     Compute predictions of ERM model to set up contrastive batches
     """
     if 'rep' in args.slice_with:
         slice_outputs = compute_slice_indices_by_rep(erm_models,
-                                                     train_loader,
+                                                     train_loaders,
                                                      cluster_umap=True,
                                                      umap_components=2,
                                                      cluster_method=args.rep_cluster_method,
@@ -277,7 +277,7 @@ def compute_slice_outputs(erm_models, train_loader, test_criterion, args):
         sliced_data_indices, sliced_data_correct, sliced_data_losses = slice_outputs
 
     if 'pred' in args.slice_with:
-        slice_outputs_ = compute_slice_indices(erm_models, train_loader,
+        slice_outputs_ = compute_slice_indices(erm_models, train_loaders,
                                                test_criterion, 1,
                                                args,
                                                resample_by='class',
@@ -293,7 +293,7 @@ def compute_slice_outputs(erm_models, train_loader, test_criterion, args):
     # Create a single loader for the combined dataset
     if args.devil:
         combined_dataset = ConcatDataset([loader.dataset for loader in train_loaders])
-        train_loader = DataLoader(
+        train_loaders= DataLoader(
             combined_dataset,
             batch_size=args.bs_trn,
             shuffle=False,
@@ -320,7 +320,7 @@ def finetune_model(encoder, criterion, test_criterion, dataloaders,
     """
     Instead of joint training, finetune classifier
     """
-    train_loader, val_loader, test_loader = dataloaders
+    train_loaders, val_loader, test_loader = dataloaders
     model = get_net(args)
     state_dict = encoder.to(torch.device('cpu')).state_dict()
     model = load_encoder_state_dict(model, state_dict)
@@ -344,7 +344,7 @@ def finetune_model(encoder, criterion, test_criterion, dataloaders,
     erm_models.to(args.device)
     erm_models.eval()
     slice_outputs = compute_slice_outputs(erm_models,
-                                          train_loader,
+                                          train_loaders,
                                           test_criterion,
                                           args)
     sliced_data_indices, sliced_data_correct, sliced_data_losses = slice_outputs
@@ -355,13 +355,13 @@ def finetune_model(encoder, criterion, test_criterion, dataloaders,
     print(heading)
     sliced_val_loader = val_loader
     sliced_train_sampler = SubsetRandomSampler(indices)
-    sliced_train_loader = DataLoader(train_loader.dataset,
+    sliced_train_loaders= DataLoader(train_loaders.dataset,
                                      batch_size=args.bs_trn,
                                      sampler=sliced_train_sampler,
                                      num_workers=args.num_workers)
     args.model_type = '2s2s_ss'
     outputs = train_model(model, optim, criterion,
-                          sliced_train_loader,
+                          sliced_train_loaders,
                           sliced_val_loader, args, 0,
                           args.finetune_epochs, True,
                           test_loader, test_criterion)
@@ -582,18 +582,18 @@ def main():
     else:
         load_dataloaders, visualize_dataset = initialize_data(args, devil=False)
         loaders = load_dataloaders(args, train_shuffle=False)
-        train_loader, val_loader, test_loader = loaders
+        train_loaders, val_loader, test_loader = loaders
         
 
     if args.resample_class != '':
-        resampled_indices = get_resampled_indices(dataloader=train_loader,
+        resampled_indices = get_resampled_indices(dataloader=train_loaders,
                                                   args=args,
                                                   sampling=args.resample_class,
                                                   seed=args.seed)
-        train_set_resampled = get_resampled_set(dataset=train_loader.dataset,
+        train_set_resampled = get_resampled_set(dataset=train_loaders.dataset,
                                                 resampled_set_indices=resampled_indices,
                                                 copy_dataset=True)
-        train_loader = DataLoader(train_set_resampled,
+        train_loaders= DataLoader(train_set_resampled,
                                   batch_size=args.bs_trn,
                                   shuffle=False,
                                   num_workers=args.num_workers)
@@ -601,7 +601,7 @@ def main():
         if args.devil:
             log_data(train_loaders[0].dataset.dataset, 'Train dataset:')  # Subset → Waterbirds
         else:
-            log_data(train_loader.dataset, 'Train dataset:')
+            log_data(train_loaders.dataset, 'Train dataset:')
         log_data(val_loader.dataset, 'Val dataset:')
         log_data(test_loader.dataset, 'Test dataset:')
     if args.evaluate is True:
@@ -725,7 +725,7 @@ def main():
         contrastive_points = prepare_contrastive_points(sliced_data_indices,
                                                         sliced_data_losses,
                                                         sliced_data_correct,
-                                                        train_loader, args)
+                                                        train_loaders, args)
         slice_anchors, slice_negatives, positives_by_class, all_targets = contrastive_points
 
         adjust_num_pos_neg_(positives_by_class, slice_negatives, args)
@@ -789,7 +789,7 @@ def main():
 
         # Get contrastive batches for first epoch
         epoch = 0
-        contrastive_dataloader = load_contrastive_data(train_loader,
+        contrastive_dataloader = load_contrastive_data(train_loaders,
                                                        slice_anchors,
                                                        slice_negatives,
                                                        positives_by_class,
@@ -846,7 +846,7 @@ def main():
                 # Visualize
                 suffix = f'(epoch {epoch}, epoch loss: {np.mean(epoch_loss):<.3f}, train)'
                 save_id = f'{args.contrastive_type[0]}-tr-e{epoch}-final'
-                visualize_activations(encoder, dataloader=train_loader,
+                visualize_activations(encoder, dataloader=train_loaders,
                                       label_types=[
                                           'target', 'spurious', 'group_idx'],
                                       num_data=1000, figsize=(8, 6), save=True,
@@ -874,12 +874,12 @@ def main():
                 model.classifier = classifier
 
             if epoch + 1 < args.max_epoch:
-                evaluate_model(model, [train_loader, val_loader],
+                evaluate_model(model, [train_loaders, val_loader],
                                ['Training', 'Validation'],
                                test_criterion, args, epoch)
 
                 print(f'Experiment name: {args.experiment_name}')
-                contrastive_dataloader = load_contrastive_data(train_loader,
+                contrastive_dataloader = load_contrastive_data(train_loaders,
                                                                slice_anchors,
                                                                slice_negatives,
                                                                positives_by_class,
@@ -887,7 +887,7 @@ def main():
                                                                args)
             else:
                 if args.finetune_epochs > 0:
-                    dataloaders = (train_loader, val_loader, test_loader)
+                    dataloaders = (train_loaders, val_loader, test_loader)
                     model = finetune_model(encoder, criterion,
                                            test_criterion, dataloaders,
                                            erm_models, args)
