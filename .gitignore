@@ -1,0 +1,9 @@
+/datasets/data
+/datasets/data
+*.jpg
+*.jpg
+/images
+/results
+/logs/colored_mnist
+/logs
+/model

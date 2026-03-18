@@ -1,0 +1,81 @@
+Bias model training:
+
+Check load_dataloaders() clean
+initialize_data() updated
+Check get_resampled_indices() and get_resampled_set() looks clean
+Check train_spurious_model()
+
+Unbias model training()
+Same except the loss function
+
+Check prepare_contrastive_points
+adjust_num_pos_neg_
+update_args (not important)
+ContrastiveNet
+
+
+-------------------------
+
+update the logit output. 
+
+erm_model needs to be turned into multiple
+
+
+
+--------------------------
+compute_slice_indices by_rep'teki gibi düzeltilmeli
+
+
+
+
+
+
+
+
+
+STARGE Website - Updated Feature List
+Core Pages
+
+Homepage - Hero, company intro, featured projects, team highlights, CTA
+About/Company Profile - Mission, vision, values, timeline, achievements
+Projects - Grid/list view, filtering, search, project cards
+Project Detail - Hero, specs, gallery, team involved, related projects
+Team - Member grid, bios, roles, filter by expertise
+Contact - Form, map, contact info, social links
+Documentation - Technical docs, API references, guides, tutorials
+
+Functionality
+
+Contact Form - Validation, spam protection, auto-reply
+Project Filtering - By category/technology
+Search - Site-wide or project search (including docs)
+Responsive Design - Mobile, tablet, desktop
+Multi-language (optional) - EN/TR toggle
+Code Snippets - Syntax highlighting for technical content
+Version Control (docs) - Document versioning if needed
+
+Backend/CMS
+
+Content Management - Easy project/team updates
+Form Handler - Email integration
+Analytics - Google Analytics, tracking
+SEO - Meta tags, sitemap, schema markup
+
+Security & Performance
+
+SSL Certificate
+CDN (optional)
+Image Optimization
+Fast Loading - Performance optimized
+
+Future Features
+
+Blog/News section
+Newsletter subscription
+Case studies
+Client testimonials
+Publications section
+Career page
+Interactive project demos
+API documentation (if applicable)
+Developer portal

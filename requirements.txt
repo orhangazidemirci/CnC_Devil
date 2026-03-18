@@ -1,0 +1,9 @@
+matplotlib
+pandas
+pillow
+scikit-learn
+scipy
+tqdm
+transformers
+tqdm
+umap-learn
