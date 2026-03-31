@@ -312,7 +312,7 @@ def compute_slice_outputs(erm_models, train_loaders, test_criterion, args):
         sliced_data_correct = sliced_data_correct_
         sliced_data_losses = sliced_data_losses_
 
-    return sliced_data_indices, sliced_data_correct, sliced_data_losses
+    return sliced_data_indices, sliced_data_correct, sliced_data_losses, train_loaders
 
 
 def finetune_model(encoder, criterion, test_criterion, dataloaders,
@@ -347,7 +347,7 @@ def finetune_model(encoder, criterion, test_criterion, dataloaders,
                                           train_loaders,
                                           test_criterion,
                                           args)
-    sliced_data_indices, sliced_data_correct, sliced_data_losses = slice_outputs
+    sliced_data_indices, sliced_data_correct, sliced_data_losses, train_loaders = slice_outputs
     erm_models.to(torch.device('cpu'))
     indices = np.hstack(sliced_data_indices)
     heading = f'Finetuning on aggregated slices'
@@ -529,7 +529,7 @@ def main():
     args.image_path = f'./images/{args.dataset}/{args.arch}/'
 
     args.experiment_name = f'devil-{args.devil}_arch-{args.arch}_bs-{args.bs_trn}_dataset-{args.dataset}'
-
+    args.log_path = f'./logs/{args.dataset}/{args.experiment_name}'
     # Set actual default weight_decay for classifier
     if args.weight_decay_c < 0:
         args.weight_decay_c = args.weight_decay
@@ -548,9 +548,9 @@ def main():
         train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
     else:
         load_dataloaders, visualize_dataset = initialize_data(args)
-    init_args(args)
+    #init_args(args)
     init_experiment(args)
-    update_args(args)
+    #update_args(args)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -701,7 +701,7 @@ def main():
     if args.train_encoder is True:
     
         slice_outputs = compute_slice_outputs(erm_models,  train_loaders,test_criterion, args)
-        sliced_data_indices, sliced_data_correct, sliced_data_losses = slice_outputs
+        sliced_data_indices, sliced_data_correct, sliced_data_losses, train_loaders = slice_outputs
 
         if args.devil:
             for i in range(args.num_bias_models):

@@ -221,26 +221,26 @@ def compute_slice_indices_by_rep(bias_models, dataloaders,
 def compute_cluster_assignment(cluster_labels, dataloader):
     all_correct = []
     all_correct_by_datapoint = []
-    #all_targets = dataloader.dataset.targets_all['target']
-    all_targets = get_targets_all(dataloader.dataset)['target']
+    
+    dataset = dataloader.dataset
+    if hasattr(dataset, 'indices'):
+        all_targets = get_targets_all(dataset)['target'][dataset.indices]
+    else:
+        all_targets = get_targets_all(dataset)['target']
 
-    # This permutations thing is gross - not actually Hungarian here?
     cluster_label_permute = list(permutations(np.unique(cluster_labels)))
     for cluster_map in cluster_label_permute:
         preds = np.vectorize(cluster_map.__getitem__)(cluster_labels)
-        all_targets
         correct = (preds == all_targets)
         all_correct.append(correct.sum())
         all_correct_by_datapoint.append(correct)
     all_correct = np.array(all_correct) / len(all_targets)
     
-    # Find best assignment
     best_map = cluster_label_permute[np.argmax(all_correct)]
     cluster_labels = np.vectorize(best_map.__getitem__)(cluster_labels)
     cluster_correct = all_correct_by_datapoint[
         np.argmax(all_correct)].astype(int)
     return cluster_labels, cluster_correct
-
 
 def combine_data_indices(sliced_data_indices, sliced_data_correct):
     """

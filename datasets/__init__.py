@@ -204,7 +204,7 @@ def initialize_data(args):
     dataset_module = importlib.import_module(f'datasets.{args.dataset}')
     load_dataloaders = getattr(dataset_module, 'load_dataloaders')
     visualize_dataset = getattr(dataset_module, 'visualize_dataset')
-    args.root_dir = 'C:/Users/Orhan/Documents/GitHub/correct-n-contrast/datasets/data/Waterbirds/'
+    args.root_dir = 'C:/Users/odemirci/Documents/GitHub/CnC_Devil/datasets/data/Waterbirds/'
     if 'waterbirds' in args.dataset:
         if not hasattr(args, 'root_dir') or args.root_dir is None:
             args.root_dir = '../slice-and-dice-smol/datasets/data/Waterbirds/'

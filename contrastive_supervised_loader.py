@@ -14,8 +14,13 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
-from torch.utils.data import DataLoader
 from datasets import get_resampled_set
+from torch.utils.data import DataLoader, ConcatDataset
+
+def get_targets_all(dataset):
+    if hasattr(dataset, 'dataset'):  # Subset
+        return dataset.dataset.targets_all
+    return dataset.targets_all
 
 
 def prepare_contrastive_points(sliced_data_indices,
@@ -23,9 +28,30 @@ def prepare_contrastive_points(sliced_data_indices,
                                sliced_data_correct,
                                train_loader, args):
 
-    train_targets_all = train_loader.dataset.targets_all
+    dataset = train_loader.dataset
+    
+    if isinstance(dataset, ConcatDataset):
+        all_targets = np.concatenate([
+            get_targets_all(d)['target'][d.indices] if hasattr(d, 'indices')
+            else get_targets_all(d)['target']
+            for d in dataset.datasets
+        ])
+        all_spurious = np.concatenate([
+            get_targets_all(d)['spurious'][d.indices] if hasattr(d, 'indices')
+            else get_targets_all(d)['spurious']
+            for d in dataset.datasets
+        ])
+        train_targets_all = {'target': all_targets, 'spurious': all_spurious}
+    else:
+        dataset = train_loader.dataset
+        if hasattr(dataset, 'dataset'):  # Subset
+            train_targets_all = dataset.dataset.targets_all
+        else:
+            train_targets_all = dataset.targets_all
+
     train_targets = train_targets_all['target']
     train_spurious = train_targets_all['spurious']
+    
     sliced_data_indices_all = np.concatenate(sliced_data_indices)
     sliced_data_losses_all = np.zeros(len(train_targets))
     sliced_data_losses_all[sliced_data_indices_all] = np.concatenate(
