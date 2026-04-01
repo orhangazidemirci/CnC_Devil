@@ -527,8 +527,10 @@ def main():
     args = parser.parse_args()
     args.results_path = f'./results/{args.dataset}/{args.arch}/'
     args.image_path = f'./images/{args.dataset}/{args.arch}/'
-
+    args.model_path = f'./model/{args.dataset}/{args.arch}/'
+    args.bias_model_path = f'./model/{args.dataset}/{args.arch}/saved_bias_models' # New dir for this version
     args.experiment_name = f'devil-{args.devil}_arch-{args.arch}_bs-{args.bs_trn}_dataset-{args.dataset}'
+    
     args.log_path = f'./logs/{args.dataset}/{args.experiment_name}'
     # Set actual default weight_decay for classifier
     if args.weight_decay_c < 0:
@@ -677,8 +679,11 @@ def main():
            erm_models = []
            for i in range(args.num_bias_models):
                 print(f'Partition {i}:')
-                partition_erm_models = load_pretrained_model(args.pretrained_spurious_path,
-                                                            args, partition_ix=i)
+                fpath = os.path.join(args.bias_model_path, f"bias_model_{i}_best.pth")
+                os.makedirs(os.path.dirname(fpath), exist_ok=True)
+
+                partition_erm_models = load_pretrained_model(fpath,
+                                                            args)
                 partition_erm_models.eval()
                 erm_models.append(partition_erm_models)  
         else:   

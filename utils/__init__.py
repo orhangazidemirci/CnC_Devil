@@ -93,38 +93,7 @@ def init_experiment(args):
   #  args.experiment_name = f'a={arch}-d={args.dataset}-tm={args.train_method}{sample}-{model_params}-{model_params_s}-s={args.seed}-r={args.replicate}'
     set_seed(args.seed)
 
-    # Update saving paths
-    new_model_path = join(args.model_path, args.dataset)
-    new_image_path = join(args.image_path, args.dataset)
-    new_log_path = join(args.log_path, args.dataset)
-    new_results_path = join(args.results_path, args.dataset)
-    if not exists(new_model_path):
-        os.makedirs(new_model_path)
-    if not exists(new_image_path):
-        os.makedirs(new_image_path)
-    if not exists(new_log_path):
-        os.makedirs(new_log_path)
-    if not exists(new_results_path):
-        os.makedirs(new_results_path)
-    # Make more granular - save specific folders per experiment configs
-    new_model_path = join(new_model_path, experiment_configs)
-    new_image_path = join(new_image_path, experiment_configs)
-    new_log_path = join(new_log_path, experiment_configs)
-    new_results_path = join(new_results_path, experiment_configs)
-    if not exists(new_model_path):
-        os.makedirs(new_model_path)
-    if not exists(new_image_path):
-        os.makedirs(new_image_path)
-    if not exists(new_log_path):
-        os.makedirs(new_log_path)
-    if not exists(new_results_path):
-        os.makedirs(new_results_path)
-    args.model_path = new_model_path
-    args.image_path = new_image_path
-    args.log_path = new_log_path
-    args.results_path = new_results_path
-    
-    
+
 def init_args(args):
     args.supervised_contrast = True
     args.prioritize_spurious_pos = False
@@ -165,9 +134,6 @@ def init_args(args):
     # Misc. - can't spell
     args.log_interval = 1
     args.log_path = './logs'
-    args.results_path = './results'
-    args.model_path = './model'
-    args.image_path = './images'
     args.img_file_type = '.png'
     
     # Slicing

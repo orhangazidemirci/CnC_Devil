@@ -228,15 +228,15 @@ def random_exclude(n, exclude):
     candidates = [i for i in range(n + 1) if i != exclude]
     return random.choice(candidates)
 
-def train_spurious_model(train_loader, args, resample=False,
+def train_spurious_model(train_loaders, args, resample=False,
                          return_loaders=False, test_loader=None,
                          test_criterion=None):
     
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
-
+    _, val_loader, test_loader, visualize_dataset = initialize_data(args)
+    del _
     if args.devil:
         pass
     else:
@@ -279,8 +279,8 @@ def train_spurious_model(train_loader, args, resample=False,
     
     log_test_results = True if test_loader is not None else False
     
-    SAVED_MODELS_DIR = f'./{args.dataset}/{args.arch}/saved_bias_models' # New dir for this version
-    os.makedirs(SAVED_MODELS_DIR, exist_ok=True)
+    #SAVED_MODELS_DIR = f'./{args.dataset}/{args.arch}/saved_bias_models' # New dir for this version
+    os.makedirs(args.bias_model_path, exist_ok=True)
         
     ##### N BIAS IMPLEMENTATION
     
@@ -337,7 +337,7 @@ def train_spurious_model(train_loader, args, resample=False,
             
             # For DEVIL, we train each bias model on a different slice of the data
             model_train_loader = train_loaders[model_idx]
-            model_save_path = os.path.join(SAVED_MODELS_DIR, f"bias_model_{model_idx}_best.pth")
+            model_save_path = os.path.join(args.bias_model_path, f"bias_model_{model_idx}_best.pth")
 
 
             # best_val_accuracy_on_global_val = 0.0 # For saving the best version of this model
@@ -363,7 +363,7 @@ def train_spurious_model(train_loader, args, resample=False,
 
         # For classical path, we train each bias model on the same spurious training data
         model_train_loader = train_loader_spurious
-        model_save_path = os.path.join(SAVED_MODELS_DIR, f"bias_model_best.pth")
+        model_save_path = os.path.join(args.bias_model_path, f"bias_model_original_best.pth")
         
         # Classical path — unchanged
         outputs = train_model(net, optim, criterion,

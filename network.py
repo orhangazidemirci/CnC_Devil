@@ -172,8 +172,7 @@ def load_pretrained_model(path, args):
 
 
 def save_checkpoint(model, optim, loss, epoch, batch, args,
-                    replace=True, retrain_epoch=None,
-                    identifier=None):
+                    replace=True, retrain_epoch=None):
     optim_state_dict = optim.state_dict() if optim is not None else None
     save_dict = {'epoch': epoch,
                  'batch': batch,
@@ -185,8 +184,6 @@ def save_checkpoint(model, optim, loss, epoch, batch, args,
     cpb_str = f'-cpb={batch}' if batch is not None else ''
     fname = f'cp-{args.experiment_name}-cpe={epoch}{cpb_str}.pt'  # h.tar'
     
-    if identifier is not None:
-        fname = fname.replace('cp-', f'cp-{identifier}-')
     fpath = os.path.join(args.model_path, fname)
     
     # Create directory if it doesn't exist and handle long paths
