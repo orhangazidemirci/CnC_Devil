@@ -688,7 +688,7 @@ def main():
                 erm_models.append(partition_erm_models)  
         else:   
             erm_models = load_pretrained_model(args.pretrained_spurious_path, args)
-        erm_models.eval()
+            erm_models.eval()
         args.mode = 'train_spurious'
     else:
         args.mode = 'train_spurious'
