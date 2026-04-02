@@ -312,7 +312,8 @@ def load_contrastive_data(train_loader, slice_anchors,
                           slice_negatives, positives_by_class,
                           seed, args, supervised_contrast=True):
     # Get number of negatives per target class
-    args.num_negatives_by_target = [0] * args.num_classes
+    args.num_negatives_by_target = [0] * len(slice_negatives)  # ← fix size, before loop
+
     assert args.replicate % 2 == 0  # Checking / debugging
 
     batch_samples = []
@@ -327,7 +328,6 @@ def load_contrastive_data(train_loader, slice_anchors,
         negative_dict = slice_negatives[slice_ix]
         # For hard negative
         args.num_negatives_by_target[slice_ix] = len(negative_dict['ix'])
-
         if args.balance_targets:
             n_samples = int(np.round(args.target_sample_ratio *
                                      max_sample_size))

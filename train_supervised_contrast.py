@@ -475,7 +475,7 @@ def main():
     parser.add_argument('--erm_only', default=False, action='store_true')
 
     # Training spurious features model
-    parser.add_argument('--pretrained_spurious_path', default='', type=str)
+    parser.add_argument('--pretrained_spurious_path', default='True', type=str)
     parser.add_argument('--max_epoch_s', type=int, default=1,
                         help="Number of epochs to train initial spurious model")
     parser.add_argument('--bs_trn_s', type=int, default=32,
@@ -699,9 +699,11 @@ def main():
     if args.devil:
         for i in range(args.num_bias_models):
             erm_models[i].eval()
+        print(f'Pretrained model loaded from {fpath}')
+
     else:
         erm_models.eval()
-    print(f'Pretrained model loaded from {args.pretrained_spurious_path}')
+        print(f'Pretrained model loaded from {args.pretrained_spurious_path}')
 
     if args.train_encoder is True:
     
