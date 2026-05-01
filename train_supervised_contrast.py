@@ -3,6 +3,7 @@ Correct-n-Contrast main script
 """
 
 import os
+from sched import scheduler
 import sys
 import copy
 import argparse
@@ -37,11 +38,11 @@ from network import get_output, backprop_, get_bert_scheduler, _get_linear_sched
 from activations import visualize_activations
 # Contrastive
 from contrastive_supervised_loader import prepare_contrastive_points, load_contrastive_data, adjust_num_pos_neg_
-from contrastive_network import ContrastiveNet, load_encoder_state_dict, compute_outputs
-from contrastive_network import SupervisedContrastiveLoss
+from contrastive_network import DEFAULT_WEIGHTS, ContrastiveNet, load_encoder_state_dict, compute_outputs
+from contrastive_network import DevilNetLoss
 from slice import compute_pseudolabels, compute_slice_indices, train_spurious_model
 # Alternative slicing by UMAP clustering
-from slice_rep import compute_slice_indices_by_rep, combine_data_indices
+from slice_rep import compute_devil_net_signals, compute_slice_indices_by_rep, combine_data_indices
 
 import transformers
 transformers.logging.set_verbosity_error()
@@ -50,269 +51,161 @@ import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 
-def train_epoch(encoder, classifier, dataloader,
-                optim_e, optim_c, scheduler_e, scheduler_c,
-                epoch, val_loader, contrastive_loss,
-                cross_entropy_loss, args):
+def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
     """
-    Train contrastive epoch
+    One full training epoch.
+
+    Returns dict of mean losses for the epoch.
     """
-    encoder.to(args.device)
-    classifier.to(args.device)
+    model.train()
+    losses = {'total': [], 'ce': [], 'self': [], 'batch': []}
 
-    optim_e.zero_grad()
-    optim_c.zero_grad()
-    contrastive_weight = args.contrastive_weight
-    loss_compute_size = int(args.num_anchor +
-                            args.num_negative +
-                            args.num_positive +
-                            args.num_negative_easy)
-    epoch_losses = []
-    epoch_losses_contrastive = []
-    epoch_losses_cross_entropy = []
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
 
-    encoder.eval()
-    classifier.train()
+    for batch in pbar:
+        inputs, labels, indices = batch
+        inputs  = inputs.to(args.device)
+        labels  = labels.to(args.device)
+        indices = indices.to(args.device)
 
-    total_updates = int(len(dataloader) * args.batch_factor)
-    pbar = tqdm(total=total_updates)
-    for batch_ix, batch_data in enumerate(dataloader):
+        optimizer.zero_grad()
 
-        batch_loss = 0
-        batch_loss_contrastive = 0
-        batch_loss_cross_entropy = 0
-        batch_loss_kl = 0
-        batch_count = 0
+        # Forward — model must return (embeddings, logits)
+        embeddings, logits = model(inputs)
 
-        # Setup main contrastive batch
-        all_batch_inputs, all_batch_labels, all_batch_indices = batch_data
-        batch_inputs = torch.split(all_batch_inputs,
-                                   loss_compute_size)
-        batch_labels = torch.split(all_batch_labels,
-                                   loss_compute_size)
-        batch_indices = np.split(all_batch_indices, len(batch_inputs))
+        # CE on classifier head
+        ce_loss = F.cross_entropy(logits, labels)
 
-        if args.supervised_linear_scale_up:
-            supervised_weight = ((1 - args.contrastive_weight) *
-                                 ((epoch * len(dataloader) + batch_ix) *
-                                 args.supervised_step_size))
-        elif epoch < args.supervised_update_delay:
-            supervised_weight = 0
-        else:
-            supervised_weight = 1 - args.contrastive_weight
+        # Self + batch contrastive losses
+        contrastive_loss, self_loss, batch_loss = loss_fn(indices, embeddings)
 
-        for ix, batch_input in enumerate(batch_inputs):
-            neg_start_ix = args.num_anchor + args.num_positive
-            neg_end_ix = neg_start_ix + args.num_negative
+        total_loss = ce_loss + contrastive_loss
+        total_loss.backward()
 
-            inputs_a = batch_input[:args.num_anchor]
-            inputs_p = batch_input[args.num_anchor:neg_start_ix]
-            inputs_n = batch_input[neg_start_ix:neg_end_ix]
-            inputs_ne = batch_input[-args.num_negative_easy:]
+        if getattr(args, 'clip_grad_norm', False):
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            labels_a = batch_labels[ix][:args.num_anchor]
-            labels_p = batch_labels[ix][args.num_anchor:neg_start_ix]
-            labels_n = batch_labels[ix][neg_start_ix:neg_end_ix]
-            labels_ne = batch_labels[ix][-args.num_negative_easy:]
+        optimizer.step()
 
-            # Just do contrastive loss against first anchor for now
-            inputs_a_ = [inputs_a[0]]
-            for anchor_ix, input_a in enumerate(inputs_a_):
-                contrastive_batch = torch.vstack((input_a.unsqueeze(0),
-                                                  inputs_p, inputs_n))
-                # Compute contrastive loss
-                loss = contrastive_loss(encoder, contrastive_batch)
-                loss *= ((1 - supervised_weight) /
-                         (len(inputs_a_) * len(batch_inputs)))
-                loss.backward()
-                contrastive_batch = contrastive_batch.detach().cpu()
+        losses['total'].append(total_loss.item())
+        losses['ce'].append(ce_loss.item())
+        losses['self'].append(self_loss.item())
+        losses['batch'].append(batch_loss.item())
 
-                batch_loss += loss.item()
-                batch_loss_contrastive += loss.item()
-                free_gpu([loss], delete=True)
+        pbar.set_postfix({k: f'{np.mean(v):.4f}' for k, v in losses.items()})
 
-                # Two-sided contrastive update
-                if args.num_negative_easy > 0:
-                    contrastive_batch = torch.vstack(
-                        (inputs_p[0].unsqueeze(0), inputs_a, inputs_ne)
-                    )
-                    # Compute contrastive loss
-                    loss = contrastive_loss(encoder, contrastive_batch)
-                    loss *= ((1 - supervised_weight) /
-                             (len(inputs_a_) * len(batch_inputs)))
-                    loss = loss.mean()
-                    loss.backward()
-                    contrastive_batch = contrastive_batch.detach().cpu()
+    return {k: np.mean(v) for k, v in losses.items()}
 
-                    batch_loss += loss.item()
-                    batch_loss_contrastive += loss.item()
-                    free_gpu([loss], delete=True)
 
-                if args.finetune_epochs > 0:
-                    continue
+# ---------------------------------------------------------------------------
+# Step 3 — evaluate
+# Returns average accuracy and worst-group accuracy
+# ---------------------------------------------------------------------------
 
-                # Compute cross-entropy loss jointly
-                if anchor_ix + 1 == len(inputs_a_):
-                    input_list = [inputs_a, inputs_p, inputs_n, inputs_ne]
-                    label_list = [labels_a, labels_p, labels_n, labels_ne]
-                    min_input_size = np.min([len(x) for x in input_list])
-                    contrast_inputs = torch.cat(
-                        [x[:min_input_size] for x in input_list])
-                    contrast_labels = torch.cat(
-                        [l[:min_input_size] for l in label_list])
-                    if loss_compute_size <= args.bs_trn:
-                        output, loss = compute_outputs(contrast_inputs,
-                                                       encoder, classifier,
-                                                       args,
-                                                       contrast_labels,
-                                                       True,
-                                                       cross_entropy_loss)
-                        loss *= (supervised_weight / len(batch_inputs))
-                        loss.backward()
-                        batch_loss += loss.item()
-                        batch_loss_cross_entropy += loss.item()
-                        free_gpu([loss], delete=True)
-                    else:
-                        shuffle_ix = np.arange(contrast_inputs.shape[0])
-                        np.random.shuffle(shuffle_ix)
-                        contrast_inputs = contrast_inputs[shuffle_ix]
-                        contrast_labels = contrast_labels[shuffle_ix]
+def evaluate(model, dataloader, args, group_labels=None):
+    """
+    Evaluates model on a dataloader.
 
-                        contrast_inputs = torch.split(contrast_inputs,
-                                                      args.bs_trn)
-                        contrast_labels = torch.split(contrast_labels,
-                                                      args.bs_trn)
+    Args:
+        model        : model with forward() returning (embeddings, logits)
+        dataloader   : evaluation DataLoader
+        args         : args namespace
+        group_labels : optional np.ndarray (N,) of group ids for worst-group eval
 
-                        for cix, contrast_input in enumerate(contrast_inputs):
-                            weight = contrast_input.shape[0] / len(shuffle_ix)
-                            output, loss = compute_outputs(contrast_input,
-                                                           encoder,
-                                                           classifier,
-                                                           args,
-                                                           contrast_labels[cix],
-                                                           True,
-                                                           cross_entropy_loss)
-                            loss *= (supervised_weight * weight /
-                                     len(batch_inputs))
-                            loss.backward()
+    Returns dict with:
+        avg_acc       : float — overall accuracy
+        worst_group   : float — worst-group accuracy (if group_labels provided)
+        group_accs    : dict  — per-group accuracy (if group_labels provided)
+    """
+    model.eval()
+    all_preds  = []
+    all_labels = []
+    all_idx    = []
 
-                            batch_loss += loss.item()
-                            batch_loss_cross_entropy += loss.item()
-
-                            free_gpu([loss, output], delete=True)
-                batch_count += 1
-            pbar.update(1)
-
-        if args.arch == 'bert-base-uncased_pt':
-            if args.clip_grad_norm:
-                torch.nn.utils.clip_grad_norm_(encoder.parameters(),
-                                               args.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(),
-                                               args.max_grad_norm)
-        if args.finetune_epochs > 0:
-            optim_e.step()
-            if scheduler_e is not None:
-                scheduler_e.step()
-            optim_e.zero_grad()
-        else:
-            optim_e.step()
-            if scheduler_e is not None:
-                scheduler_e.step()
-            optim_c.step()
-            if scheduler_c is not None:
-                scheduler_c.step()
-            optim_e.zero_grad()
-
-            # Experimenting with classifier accumulated gradient
-            if args.replicate > 50:
-                optim_c.zero_grad()
-
-        epoch_losses.append(batch_loss)
-        epoch_losses_contrastive.append(batch_loss_contrastive)
-        epoch_losses_cross_entropy.append(batch_loss_cross_entropy)
-
-        if (batch_ix + 1) % args.log_loss_interval == 0:
-            print_output = f'Epoch {epoch:>3d} | Batch {batch_ix:>4d} | '
-            print_output += f'Loss: {batch_loss:<.4f} (Epoch Avg: {np.mean(epoch_losses):<.4f}) | '
-            print_output += f'CL: {batch_loss_contrastive:<.4f} (Epoch Avg: {np.mean(epoch_losses_contrastive):<.4f}) | '
-            print_output += f'CE: {batch_loss_cross_entropy:<.4f}, (Epoch Avg: {np.mean(epoch_losses_cross_entropy):<.4f}) | '
-            print_output += f'SW: {supervised_weight:<.4f}'
-            print(print_output)
-
-        if ((batch_ix + 1) % args.checkpoint_interval == 0 or
-                (batch_ix + 1) == len(dataloader)):
-            model = get_net(args)
-            state_dict = encoder.to(torch.device('cpu')).state_dict()
-            model = load_encoder_state_dict(model, state_dict)
-            if 'bert' in args.arch:
-                model.classifier = classifier
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc='Evaluating'):
+            if len(batch) == 3:
+                inputs, labels, indices = batch
             else:
-                model.fc = classifier
-            checkpoint_name = save_checkpoint(model, None,
-                                              np.mean(epoch_losses),
-                                              epoch, batch_ix, args,
-                                              replace=True,
-                                              retrain_epoch=-1,
-                                              identifier='fm')
-            args.checkpoint_name = checkpoint_name
+                inputs, labels = batch
+                indices = None
 
-    epoch_losses = (epoch_losses,
-                    epoch_losses_contrastive,
-                    epoch_losses_cross_entropy)
-    return encoder, classifier, epoch_losses
+            inputs = inputs.to(args.device)
+            labels = labels.to(args.device)
 
+            _, logits = model(inputs)
+            _, preds  = torch.max(logits, dim=1)
 
-def compute_slice_outputs(erm_models, train_loaders, test_criterion, args):
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            if indices is not None:
+                all_idx.append(indices.cpu().numpy())
+
+    all_preds  = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+
+    avg_acc = (all_preds == all_labels).mean()
+    results = {'avg_acc': avg_acc}
+
+    # Worst-group accuracy
+    if group_labels is not None:
+        all_idx = np.concatenate(all_idx) if all_idx else np.arange(len(all_labels))
+        group_accs = {}
+        for g in np.unique(group_labels):
+            g_mask         = group_labels[all_idx] == g
+            group_accs[g]  = (all_preds[g_mask] == all_labels[g_mask]).mean() \
+                             if g_mask.sum() > 0 else 0.0
+        results['worst_group'] = min(group_accs.values())
+        results['group_accs']  = group_accs
+
+    return results
+
+def compute_slice_outputs(erm_models, train_loaders, args):
     """
     Compute predictions of ERM model to set up contrastive batches
     """
-    if 'rep' in args.slice_with:
-        slice_outputs = compute_slice_indices_by_rep(erm_models,
-                                                     train_loaders,
-                                                     cluster_umap=True,
-                                                     umap_components=2,
-                                                     cluster_method=args.rep_cluster_method,
-                                                     args=args,
-                                                     visualize=True)
-        sliced_data_indices, sliced_data_correct, sliced_data_losses = slice_outputs
 
-    if 'pred' in args.slice_with:
-        slice_outputs_ = compute_slice_indices(erm_models, train_loaders,
-                                               test_criterion, 1,
-                                               args,
-                                               resample_by='class',
-                                               loss_factor=args.loss_factor,
-                                               use_dataloader=True)
-        
-        sliced_data_indices_, sliced_data_losses_, sliced_data_correct_, sliced_data_probs_ = slice_outputs_
-    
-    
+    sliced_outputs = {
+        'angel_predictions': [],
+        'devil_predictions': [],
+        'angel_embeddings':  [],
+        'devil_embeddings':  [],
+        'targets':           [],
+    }
 
-    # Merge all partition datasets in order
+    for data_idx, train_loader in enumerate(train_loaders):
+        print_header(f'Partition {data_idx}:')
 
-    # Create a single loader for the combined dataset
-    if args.devil:
-        combined_dataset = ConcatDataset([loader.dataset for loader in train_loaders])
-        train_loaders= DataLoader(
-            combined_dataset,
-            batch_size=args.bs_trn,
-            shuffle=False,
-            num_workers=args.num_workers
-        )
+        # ✓ pass ALL models, not just data_idx
+        slice_output = compute_devil_net_signals(
+            bias_models=erm_models,
+            dataloader=train_loader,
+            data_idx=data_idx,
+            args=args
+,                )
+
+        for k in sliced_outputs:
+            sliced_outputs[k].append(slice_output[k])
+
+    # concatenate across all partitions
+    sliced_outputs = {k: np.concatenate(v, axis=0) for k, v in sliced_outputs.items()}
+
+    # ✓ wrap with index tracking
+    combined_dataset = IndexedDataset(
+        ConcatDataset([loader.dataset for loader in train_loaders])
+    )
+    train_loader = DataLoader(
+        combined_dataset,
+        batch_size=args.bs_trn,
+        shuffle=False,          # must stay False — indices must match sliced_outputs
+        num_workers=args.num_workers
+    )
+
+    # build loss function
+    loss_fn = DevilNetLoss(sliced_outputs, weights=DEFAULT_WEIGHTS, temperature=args.temperature)
 
 
-
-    if args.slice_with == 'pred_and_rep':
-        # Combine the indices
-        sliced_data_indices, sliced_data_correct = combine_data_indices(
-            [sliced_data_indices, sliced_data_indices_],
-            [sliced_data_correct, sliced_data_correct_])
-    elif args.slice_with == 'pred':
-        sliced_data_indices = sliced_data_indices_
-        sliced_data_correct = sliced_data_correct_
-        sliced_data_losses = sliced_data_losses_
-
-    return sliced_data_indices, sliced_data_correct, sliced_data_losses, train_loaders
+    return sliced_outputs, train_loaders, loss_fn
 
 
 def finetune_model(encoder, criterion, test_criterion, dataloaders,
@@ -345,9 +238,8 @@ def finetune_model(encoder, criterion, test_criterion, dataloaders,
     erm_models.eval()
     slice_outputs = compute_slice_outputs(erm_models,
                                           train_loaders,
-                                          test_criterion,
                                           args)
-    sliced_data_indices, sliced_data_correct, sliced_data_losses, train_loaders = slice_outputs
+    sliced_outputs, train_loaders, loss_fn = slice_outputs
     erm_models.to(torch.device('cpu'))
     indices = np.hstack(sliced_data_indices)
     heading = f'Finetuning on aggregated slices'
@@ -369,198 +261,277 @@ def finetune_model(encoder, criterion, test_criterion, dataloaders,
     return model
 
 
+def train_devil_net(model, erm_models, train_loaders, val_loader, test_loader,
+                    optimizer, scheduler, args, save_activations_fn,
+                    group_labels_val=None, group_labels_test=None):
+    """
+    Full Devil-NET training loop.
+
+    Args:
+        model             : the main model being trained (encoder + classifier)
+        erm_models        : list of N pretrained ERM/bias models
+        train_loaders     : list of N DataLoaders, one per partition
+        val_loader        : validation DataLoader
+        test_loader       : test DataLoader
+        optimizer         : torch optimizer
+        scheduler         : lr scheduler (or None)
+        args              : args namespace — needs:
+                              args.max_epoch, args.bs_trn, args.num_workers,
+                              args.temperature, args.alpha, args.beta,
+                              args.device, args.clip_grad_norm (optional),
+                              args.hard_neg_factor (optional)
+        save_activations_fn: function(model, loader, args) -> (emb, pred)
+        group_labels_val  : optional np.ndarray for worst-group val eval
+        group_labels_test : optional np.ndarray for worst-group test eval
+
+    Returns:
+        best_model_state : state_dict of model with best val accuracy
+        history          : list of per-epoch dicts with losses + metrics
+    """
+
+    sliced_outputs, train_loader, loss_fn= train_loaders
+
+    if args.train_encoder is not True:
+        return None, []
+
+    # ------------------------------------------------------------------
+    # Compute Angel/Devil signals once before training
+    # ------------------------------------------------------------------
+    print_header('Devil-NET: Computing Angel/Devil signals')
+
+
+
+    # Free ERM models from memory — no longer needed
+    for i in range(len(erm_models)):
+        erm_models[i].to(torch.device('cpu'))
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+    print_header('Devil-NET: Training')
+
+    history          = []
+    best_val_acc     = -1.0
+    best_model_state = None
+
+    for epoch in range(1, args.max_epoch + 1):
+
+        # Train
+        train_losses = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            args=args,
+            epoch=epoch,
+        )
+
+        # Validate
+        val_results = evaluate(
+            model=model,
+            dataloader=val_loader,
+            args=args,
+            group_labels=group_labels_val,
+        )
+
+        if scheduler is not None:
+            scheduler.step()
+
+        # Log
+        epoch_log = {'epoch': epoch, **train_losses, **{f'val_{k}': v
+                     for k, v in val_results.items()}}
+        history.append(epoch_log)
+
+        print(f'Epoch {epoch:3d} | '
+              f'loss={train_losses["total"]:.4f} '
+              f'ce={train_losses["ce"]:.4f} '
+              f'self={train_losses["self"]:.4f} '
+              f'batch={train_losses["batch"]:.4f} | '
+              f'val_avg={val_results["avg_acc"]*100:.1f}%' +
+              (f' val_worst={val_results["worst_group"]*100:.1f}%'
+               if 'worst_group' in val_results else ''))
+
+        # Save best model by val average accuracy
+        # (swap to worst_group if group_labels_val is provided)
+        monitor = val_results.get('worst_group', val_results['avg_acc'])
+        if monitor > best_val_acc:
+            best_val_acc     = monitor
+            best_model_state = {k: v.cpu().clone()
+                                for k, v in model.state_dict().items()}
+
+    # ------------------------------------------------------------------
+    # Final test evaluation on best model
+    # ------------------------------------------------------------------
+    print_header('Devil-NET: Test evaluation')
+    model.load_state_dict({k: v.to(args.device)
+                           for k, v in best_model_state.items()})
+
+    test_results = evaluate(
+        model=model,
+        dataloader=test_loader,
+        args=args,
+        group_labels=group_labels_test,
+    )
+
+    print(f'Test avg accuracy:   {test_results["avg_acc"]*100:.2f}%')
+    if 'worst_group' in test_results:
+        print(f'Test worst-group:    {test_results["worst_group"]*100:.2f}%')
+        for g, acc in test_results['group_accs'].items():
+            print(f'  Group {g}: {acc*100:.2f}%')
+
+    return best_model_state, history
+
 def main():
     parser = argparse.ArgumentParser(description='Compare & Contrast')
     # Model
+ # -------------------------------------------------------------------------
+    # Devil-NET
+    # -------------------------------------------------------------------------
     parser.add_argument('--devil', action='store_true', default=True,
-                        help='If True, partition training data into N subsets with varying bias ratios')
+                        help='Partition training data into N shards, train one bias model per shard')
     parser.add_argument('--num_bias_models', type=int, default=5,
-                        help='Number of bias model partitions (used when devil=True)')
-                        
+                        help='Number of shard partitions / bias models')
+
+    # -------------------------------------------------------------------------
+    # Architecture
+    # -------------------------------------------------------------------------
     parser.add_argument('--arch', choices=['base', 'mlp', 'cnn',
                                            'resnet50', 'resnet50_pt',
                                            'resnet34', 'resnet34_pt',
-                                           'bert-base-uncased_pt'], required=False, default='resnet50_pt')
+                                           'bert-base-uncased_pt'],
+                        required=False, default='resnet50_pt')
+    parser.add_argument('--hidden_dim', type=int, default=256,
+                        help='Hidden dim for MLP arch only')
+    parser.add_argument('--no_projection_head', default=False, action='store_true',
+                        help='If True, apply contrastive loss directly on encoder output')
 
-    parser.add_argument('--bs_trn', type=int, default=128)
-    parser.add_argument('--bs_val', type=int, default=128)
-    # Only for MLP
-    parser.add_argument('--hidden_dim', type=int, default=256)
-
+    # -------------------------------------------------------------------------
     # Data
+    # -------------------------------------------------------------------------
     parser.add_argument('--dataset', type=str, default='waterbirds')
     parser.add_argument('--resample_class', type=str, default='',
                         choices=['upsample', 'subsample', ''],
-                        help="Resample datapoints to balance classes")
+                        help='Resample datapoints to balance classes')
 
-    # Initial slicing for anchor-positive-negative generation
-    parser.add_argument('--slice_with', type=str, default='rep',
-                        choices=['rep', 'pred', 'pred_and_rep'])
-    parser.add_argument('--rep_cluster_method', type=str,
-                        default='gmm', choices=['kmeans', 'gmm'])
-    # parser.add_argument('--retrain_burn_in', type=int, default=300)
+    # -------------------------------------------------------------------------
+    # Batch sizes
+    # -------------------------------------------------------------------------
+    parser.add_argument('--bs_trn', type=int, default=128)
+    parser.add_argument('--bs_val', type=int, default=128)
 
-    # Set up contrastive batch datapoints
-    parser.add_argument('--num_anchor', type=int, default=32)
-    parser.add_argument('--num_positive', type=int, default=32)
-    parser.add_argument('--num_negative', type=int, default=32)
-    parser.add_argument('--num_negative_easy', type=int, default=0)
-    # Sample harder datapoints
-    parser.add_argument('--weight_anc_by_loss',
-                        default=False, action='store_true')
-    parser.add_argument('--weight_pos_by_loss',
-                        default=False, action='store_true')
-    parser.add_argument('--weight_neg_by_loss',
-                        default=False, action='store_true')
-    parser.add_argument('--anc_loss_temp', type=float, default=0.5)
-    parser.add_argument('--pos_loss_temp', type=float, default=0.5)
-    parser.add_argument('--neg_loss_temp', type=float, default=0.5)
+    # -------------------------------------------------------------------------
+    # Devil-NET loss weights
+    # -------------------------------------------------------------------------
+    parser.add_argument('--temperature', type=float, default=0.05,
+                        help='Contrastive temperature τ')
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help='Weight for self loss (Table 1) in L_total')
+    parser.add_argument('--beta', type=float, default=1.0,
+                        help='Weight for batch contrastive loss (Table 2) in L_total')
+    parser.add_argument('--hard_neg_factor', type=float, default=0.0,
+                        help='Dynamic hard negative reweighting factor (0 = disabled)')
 
-    parser.add_argument('--data_wide_pos', default=False, action='store_true')
-    parser.add_argument('--target_sample_ratio', type=float, default=1)
-    parser.add_argument('--balance_targets',
-                        default=False, action='store_true')
-    parser.add_argument('--additional_negatives', default=False,
-                        action='store_true')
-    parser.add_argument('--hard_negative_factor', type=float, default=0)
-    parser.add_argument('--full_contrastive', default=False,
-                        action='store_true')
-
-    # Training
-    # Contrastive model
+    # -------------------------------------------------------------------------
+    # Encoder training
+    # -------------------------------------------------------------------------
     parser.add_argument('--train_encoder', default=True, action='store_true')
-    parser.add_argument('--no_projection_head',
-                        default=False, action='store_true')
-    parser.add_argument('--projection_dim', type=int, default=128)
-    parser.add_argument('--batch_factor', type=int, default=32)
-    parser.add_argument('--temperature', type=float, default=0.05)
-    parser.add_argument('--single_pos', default=False, action='store_true')
-    # Scale up the supervised weight factor
-    parser.add_argument('--supervised_linear_scale_up', default=False,
-                        action='store_true')
-    parser.add_argument('--supervised_update_delay', type=int, default=0)
-    parser.add_argument('--contrastive_weight', type=float, default=0.5)
-    # Classifier
-    parser.add_argument('--classifier_update_interval', type=int, default=8)
-    # General training hyperparameters
+    parser.add_argument('--load_encoder', type=str, default='',
+                        help='Path to pretrained encoder checkpoint')
+    parser.add_argument('--freeze_encoder', default=False, action='store_true',
+                        help='Freeze encoder layers during stage 2 training')
+    parser.add_argument('--finetune_epochs', type=int, default=0)
+
+    # -------------------------------------------------------------------------
+    # Optimizer
+    # -------------------------------------------------------------------------
     parser.add_argument('--optim', type=str, default='sgd',
-                        choices=['AdamW', 'adam', 'sgd'])  # Keep the same for all stages
+                        choices=['AdamW', 'adam', 'sgd'])
     parser.add_argument('--max_epoch', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--weight_decay_c', type=float, default=-1)
-
+    parser.add_argument('--weight_decay_c', type=float, default=-1,
+                        help='Classifier weight decay (-1 = same as --weight_decay)')
     parser.add_argument('--stopping_window', type=int, default=30)
-    # Load pre-trained contrastive model
-    parser.add_argument('--load_encoder', type=str, default='')
-    # Freeze encoder layers during second stage training
-    parser.add_argument('--freeze_encoder', default=False,
-                        action='store_true')
-    parser.add_argument('--finetune_epochs', type=int, default=0)
-    # For BERT, whether to clip grad norm
-    parser.add_argument('--clip_grad_norm', default=False,
-                        action='store_true')
-    # LR Scheduler -> Only linear decay supported now
-    parser.add_argument('--lr_scheduler_classifier', type=str, default='')
+    parser.add_argument('--clip_grad_norm', default=False, action='store_true',
+                        help='Clip gradient norm (recommended for BERT)')
     parser.add_argument('--lr_scheduler', type=str, default='')
+    parser.add_argument('--lr_scheduler_classifier', type=str, default='')
 
-    # For BERT, whether to clip grad norm
-    parser.add_argument('--grad_clip_grad_norm',
-                        default=False, action='store_true')
-    # Actually train with balanced ERM
-    parser.add_argument('--erm', default=False, action='store_true')
-
-    # Just train with ERM / load pretrained ERM model
-    parser.add_argument('--erm_only', default=False, action='store_true')
-
-    # Training spurious features model
-    parser.add_argument('--pretrained_spurious_path', default='True', type=str)
+    # -------------------------------------------------------------------------
+    # Bias model (stage 1) training
+    # -------------------------------------------------------------------------
+    parser.add_argument('--pretrained_spurious_path', default='', type=str,
+                        help='Path to pretrained bias models (skips stage 1 if set)')
     parser.add_argument('--max_epoch_s', type=int, default=1,
-                        help="Number of epochs to train initial spurious model")
+                        help='Epochs to train each bias model')
     parser.add_argument('--bs_trn_s', type=int, default=32,
-                        help="Training batch size for core feature model")
+                        help='Batch size for bias model training')
     parser.add_argument('--lr_s', type=float, default=1e-3,
-                        help="Learning rate for spurious feature model")
-    parser.add_argument('--momentum_s', type=float, default=0.9,
-                        help="Momentum for spurious feature model")
-    parser.add_argument('--weight_decay_s', type=float, default=5e-4,
-                        help="Weight decay for spurious feature model")
-    parser.add_argument('--slice_temp', type=float, default=10)
+                        help='Learning rate for bias models')
+    parser.add_argument('--momentum_s', type=float, default=0.9)
+    parser.add_argument('--weight_decay_s', type=float, default=5e-4)
 
+    # -------------------------------------------------------------------------
+    # Baselines
+    # -------------------------------------------------------------------------
+    parser.add_argument('--erm', default=False, action='store_true',
+                        help='Train with balanced ERM')
+    parser.add_argument('--erm_only', default=False, action='store_true',
+                        help='Train with standard ERM only (no debiasing)')
+
+    # -------------------------------------------------------------------------
     # Logging
+    # -------------------------------------------------------------------------
     parser.add_argument('--log_loss_interval', type=int, default=10)
     parser.add_argument('--checkpoint_interval', type=int, default=50)
-    parser.add_argument('--grad_checkpoint_interval', type=int, default=50)
-    parser.add_argument('--log_visual_interval', type=int, default=100)
-    parser.add_argument('--log_grad_visual_interval', type=int, default=50)
     parser.add_argument('--verbose', default=False, action='store_true')
 
-    # Additional
+    # -------------------------------------------------------------------------
+    # General
+    # -------------------------------------------------------------------------
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--replicate', type=int, default=0)
     parser.add_argument('--no_cuda', default=False, action='store_true')
     parser.add_argument('--resume', default=False, action='store_true')
-    parser.add_argument('--new_slice', default=False, action='store_true')
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--evaluate', default=False, action='store_true')
 
-    # Colored MNIST specific
-    # - Ignored if args.dataset != 'colored_mnist'
-    parser.add_argument('--data_cmap', type=str, default='hsv',
-                        help="Color map for digits. If solid, color all digits the same color")
-    parser.add_argument('--test_cmap', type=str, default='',
-                        help="Color map for digits. Solid colors applies same color to all digits. Only applies if specified, and automatically changes test_shift to 'generalize'")
-    parser.add_argument('-pc', '--p_correlation', type=float, default=0.9,
-                        help="Ratio of majority group size to total size")
-    parser.add_argument('-pcc', '--p_corr_by_class', type=float, nargs='+', action='append',
-                        help="If specified, p_corr for each group, e.g. -pcc 0.9 -pcc 0.9 -pcc 0.9 -pcc 0.9 -pcc 0.9 is the same as -pc 0.9")
-    parser.add_argument('-tc', '--train_classes', type=int, nargs='+', action='append',
-                        help="How to set up the classification problem, e.g. -tc 0 1 -tc 2 3 -tc 4 5 -tc 6 7 -tc 8 9")
-    parser.add_argument('-tcr', '--train_class_ratios', type=float, nargs='+', action='append',
-                        help="If specified, introduce class imbalance by only including the specified ratio of datapoints per class, e.g. for original ratios: -tcr 1.0 -tcr 1.0 -tcr 1.0 -tcr 1.0 -tcr 1.0 ")
-    parser.add_argument('--test_shift', type=str, default='random',
-                        help="How to shift the colors encountered in the test set - choices=['random', 'unseen', 'iid', 'shift_n' 'generalize']")
-    parser.add_argument('--flipped', default=False, action='store_true',
-                        help="If true, color background and leave digit white")
-
     args = parser.parse_args()
-    args.results_path = f'./results/{args.dataset}/{args.arch}/'
-    args.image_path = f'./images/{args.dataset}/{args.arch}/'
-    args.model_path = f'./model/{args.dataset}/{args.arch}/'
-    args.bias_model_path = f'./model/{args.dataset}/{args.arch}/saved_bias_models' # New dir for this version
-    args.experiment_name = f'devil-{args.devil}_arch-{args.arch}_bs-{args.bs_trn}_dataset-{args.dataset}'
-    
-    args.log_path = f'./logs/{args.dataset}/{args.experiment_name}'
-    # Set actual default weight_decay for classifier
+
+    # -------------------------------------------------------------------------
+    # Derived paths
+    # -------------------------------------------------------------------------
+    args.results_path   = f'./results/{args.dataset}/{args.arch}/'
+    args.image_path     = f'./images/{args.dataset}/{args.arch}/'
+    args.model_path     = f'./model/{args.dataset}/{args.arch}/'
+    args.bias_model_path = f'./model/{args.dataset}/{args.arch}/saved_bias_models'
+    args.experiment_name = (f'devil-{args.devil}_arch-{args.arch}'
+                            f'_bs-{args.bs_trn}_dataset-{args.dataset}')
+    args.log_path       = f'./logs/{args.dataset}/{args.experiment_name}'
+
     if args.weight_decay_c < 0:
         args.weight_decay_c = args.weight_decay
-        
         
     if 'waterbirds' in args.dataset:
         if not hasattr(args, 'root_dir') or args.root_dir is None:
             args.root_dir = '../slice-and-dice-smol/datasets/data/Waterbirds/'
             
         
-    init_args(args)
     # load_dataloaders, visualize_dataset = initialize_data(args)
+    if args.resample_class != '':
+        if args.resample_class == 'upsample':
+            sample += '-rsc=u'
+        elif args.resample_class == 'subsample':
+            sample += '-rsc=s'
 
-    # args.criterion = 'cross_entropy'
-    if args.devil:
-        train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
-    else:
-        load_dataloaders, visualize_dataset = initialize_data(args)
     #init_args(args)
-    init_experiment(args)
     #update_args(args)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    args.mi_resampled = None
-    args.image_path = os.path.join(args.image_path, 'contrastive_umaps')
-    if not os.path.exists(args.image_path):
-        os.makedirs(args.image_path)
     args.device = (torch.device('cuda:0') if torch.cuda.is_available()
                 and not args.no_cuda else torch.device('cpu'))
     if os.path.exists(args.log_path) and args.resume:
@@ -575,17 +546,11 @@ def main():
     sys.stdout = logger
 
     criterion = get_criterion(args, reduction='mean')
-    criterion_no_reduction = get_criterion(args, reduction='none')
     test_criterion = get_criterion(args, reduction='none')
 
-    if args.devil:
-        train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
+    train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
         # train_loaders is a list of N loaders, one per bias model partition
-    else:
-        load_dataloaders, visualize_dataset = initialize_data(args, devil=False)
-        loaders = load_dataloaders(args, train_shuffle=False)
-        train_loaders, val_loader, test_loader = loaders
-        
+
 
     if args.resample_class != '':
         resampled_indices = get_resampled_indices(dataloader=train_loaders,
@@ -600,10 +565,8 @@ def main():
                                   shuffle=False,
                                   num_workers=args.num_workers)
     if args.dataset != 'civilcomments':
-        if args.devil:
-            log_data(train_loaders[0].dataset.dataset, 'Train dataset:')  # Subset → Waterbirds
-        else:
-            log_data(train_loaders.dataset, 'Train dataset:')
+        log_data(train_loaders[0].dataset.dataset, 'Train dataset:')  # Subset → Waterbirds
+   
         log_data(val_loader.dataset, 'Val dataset:')
         log_data(test_loader.dataset, 'Test dataset:')
     if args.evaluate is True:
@@ -675,20 +638,17 @@ def main():
     # -------------------
     if args.pretrained_spurious_path != '':
         print_header('> Loading spurious model')
-        if args.devil:
-           erm_models = []
-           for i in range(args.num_bias_models):
-                print(f'Partition {i}:')
-                fpath = os.path.join(args.bias_model_path, f"bias_model_{i}_best.pth")
-                os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        erm_models = []
+        for i in range(args.num_bias_models):
+            print(f'Partition {i}:')
+            fpath = os.path.join(args.bias_model_path, f"bias_model_{i}_best.pth")
+            os.makedirs(os.path.dirname(fpath), exist_ok=True)
 
-                partition_erm_models = load_pretrained_model(fpath,
-                                                            args)
-                partition_erm_models.eval()
-                erm_models.append(partition_erm_models)  
-        else:   
-            erm_models = load_pretrained_model(args.pretrained_spurious_path, args)
-            erm_models.eval()
+            partition_erm_models = load_pretrained_model(fpath,
+                                                        args)
+            partition_erm_models.eval()
+            erm_models.append(partition_erm_models)  
+
         args.mode = 'train_spurious'
     else:
         args.mode = 'train_spurious'
@@ -696,221 +656,35 @@ def main():
         args.spurious_train_split = 0.99
         erm_models, outputs, _ = train_spurious_model(train_loaders, args)
     
-    if args.devil:
-        for i in range(args.num_bias_models):
-            erm_models[i].eval()
-        print(f'Pretrained model loaded from {fpath}')
-
-    else:
-        erm_models.eval()
-        print(f'Pretrained model loaded from {args.pretrained_spurious_path}')
+    for i in range(args.num_bias_models):
+        erm_models[i].eval()
+    print(f'Pretrained model loaded from {fpath}')
 
     if args.train_encoder is True:
     
-        slice_outputs = compute_slice_outputs(erm_models,  train_loaders,test_criterion, args)
-        sliced_data_indices, sliced_data_correct, sliced_data_losses, train_loaders = slice_outputs
+        slice_outputs = compute_slice_outputs(erm_models,  train_loaders, args)
+        sliced_outputs, train_loaders, loss_fn = slice_outputs
 
-        if args.devil:
-            for i in range(args.num_bias_models):
-                print(f'Partition {i}:')
-                for _, p in erm_models[i].named_parameters():
-                    p = p.to(torch.device('cpu'))
-                    erm_models[i].to(torch.device('cpu'))
-        else:   
-            for _, p in erm_models.named_parameters():
+        for i in range(args.num_bias_models):
+            print(f'Partition {i}:')
+            for _, p in erm_models[i].named_parameters():
                 p = p.to(torch.device('cpu'))
-            erm_models.to(torch.device('cpu'))
+                erm_models[i].to(torch.device('cpu'))
+
 
         # -------------
         # Train encoder
         # -------------
-        args.checkpoint_name = ''
-        args.mode = 'contrastive_train'
-        start_epoch = 0
-        max_epoch = args.max_epoch
-
-        contrastive_points = prepare_contrastive_points(sliced_data_indices,
-                                                        sliced_data_losses,
-                                                        sliced_data_correct,
-                                                        train_loaders, args)
-        slice_anchors, slice_negatives, positives_by_class, all_targets = contrastive_points
-
-        adjust_num_pos_neg_(positives_by_class, slice_negatives, args)
-        update_args(args)
-
-        project = not args.no_projection_head
-        if args.load_encoder != '':
-            args.checkpoint_name = args.load_encoder
-            start_epoch = int(args.checkpoint_name.split(
-                '-cpe=')[-1].split('-')[0])
-            checkpoint = torch.load(os.path.join(args.model_path,
-                                                 args.checkpoint_name))
-            print(f'Checkpoint loading from {args.load_encoder}!')
-            print(f'- Resuming training at epoch {start_epoch}')
-        else:
-            checkpoint = None
-
-        encoder = ContrastiveNet(args.arch, out_dim=args.projection_dim,
-                                 projection_head=project, task=args.dataset,
-                                 num_classes=args.num_classes,
-                                 checkpoint=checkpoint)
-
-        classifier = copy.deepcopy(encoder.classifier)
-        for p in encoder.classifier.parameters():
-            p.requires_grad = False
-
-        print_header(f'Classifier initialized')
-        print(f'Testing grad dependence')
-        for n, p in classifier.named_parameters():
-            print(f'- {n}: {p.requires_grad}')
-        print(f'Classifier outputs: {encoder.num_classes}')
-
-        encoder.to(args.device)
-        optimizer = get_optim(encoder, args)
-
-        classifier.to(args.device)
-        classifier_optimizer = get_optim(classifier, args,
-                                         model_type='classifier')
-
-        # Dummy scheduler initialization
-        if 'bert' in args.arch:
-            scheduler = get_bert_scheduler(optimizer, n_epochs=1,
-                                           warmup_steps=args.warmup_steps,
-                                           dataloader=np.arange(10))
-        else:
-            if args.lr_scheduler == 'linear_decay':
-                scheduler = _get_linear_schedule_with_warmup(optimizer,
-                                                             args.warmup_steps,
-                                                             num_training_steps=10)
-            if args.lr_scheduler_classifier == 'linear_decay':
-                classifier_scheduler = _get_linear_schedule_with_warmup(
-                    classifier_optimizer, args.warmup_steps, 10)
-
-        cross_entropy_loss = get_criterion(args, reduction='mean')
-        contrastive_loss = SupervisedContrastiveLoss(args)
-
-        args.epoch_mean_loss = 1e5
-        all_losses = []
-        all_losses_cl = []
-        all_losses_ce = []
-
-        # Get contrastive batches for first epoch
-        epoch = 0
-        contrastive_dataloader = load_contrastive_data(train_loaders,
-                                                       slice_anchors,
-                                                       slice_negatives,
-                                                       positives_by_class,
-                                                       epoch + args.seed,
-                                                       args, True)
-
-        if args.supervised_linear_scale_up:
-            args.supervised_step_size = (1 / (len(contrastive_dataloader) *
-                                              args.max_epoch))
-        else:
-            args.supervised_step_size = 0
-
-        initialize_csv_metrics(args)
-        for epoch in range(start_epoch, max_epoch):
-            encoder.to(args.device)
-            classifier.to(args.device)
-
-            # Schedulers
-            scheduler = None
-            classifier_scheduler = None
-            total_updates = int(np.round(
-                len(contrastive_dataloader) * (max_epoch - start_epoch)))
-            last_epoch = int(np.round(epoch * len(contrastive_dataloader)))
-            if 'bert' in args.arch:
-                scheduler = get_bert_scheduler(optimizer, n_epochs=total_updates,
-                                               warmup_steps=args.warmup_steps,
-                                               dataloader=contrastive_dataloader,
-                                               last_epoch=last_epoch)
-            else:
-                if args.lr_scheduler == 'linear_decay':
-                    scheduler = _get_linear_schedule_with_warmup(optimizer,
-                                                                 args.warmup_steps,
-                                                                 total_updates,
-                                                                 last_epoch)
-            if args.lr_scheduler_classifier == 'linear_decay':
-                classifier_scheduler = _get_linear_schedule_with_warmup(
-                    classifier_optimizer, args.warmup_steps, total_updates, last_epoch)
-
-            train_outputs = train_epoch(encoder, classifier,
-                                        contrastive_dataloader,
-                                        optimizer, classifier_optimizer,
-                                        scheduler, classifier_scheduler,
-                                        epoch, val_loader,
-                                        contrastive_loss, cross_entropy_loss,
-                                        args)
-
-            encoder, classifier, epoch_losses = train_outputs
-            epoch_loss, epoch_loss_cl, epoch_loss_ce = epoch_losses
-            all_losses.extend(epoch_loss)
-            all_losses_cl.extend(epoch_loss_cl)
-            all_losses_ce.extend(epoch_loss_ce)
-
-            if 'bert' not in args.arch:
-                # Visualize
-                suffix = f'(epoch {epoch}, epoch loss: {np.mean(epoch_loss):<.3f}, train)'
-                save_id = f'{args.contrastive_type[0]}-tr-e{epoch}-final'
-                visualize_activations(encoder, dataloader=train_loaders,
-                                      label_types=[
-                                          'target', 'spurious', 'group_idx'],
-                                      num_data=1000, figsize=(8, 6), save=True,
-                                      ftype=args.img_file_type, title_suffix=suffix,
-                                      save_id_suffix=save_id, args=args,
-                                      annotate_points=None)
-                suffix = f'(epoch {epoch}, epoch loss: {np.mean(epoch_loss):<.3f}, test)'
-                save_id = f'{args.contrastive_type[0]}-e{epoch}-final'
-                visualize_activations(encoder, dataloader=val_loader,
-                                      label_types=[
-                                          'target', 'spurious', 'group_idx'],
-                                      num_data=None, figsize=(8, 6), save=True,
-                                      ftype=args.img_file_type, title_suffix=suffix,
-                                      save_id_suffix=save_id, args=args,
-                                      annotate_points=None)
-            # Test
-            encoder.to(torch.device('cpu'))
-            classifier.to(torch.device('cpu'))
-            model = get_net(args)
-            state_dict = encoder.to(torch.device('cpu')).state_dict()
-            model = load_encoder_state_dict(model, state_dict)
-            try:
-                model.fc = classifier
-            except:
-                model.classifier = classifier
-
-            if epoch + 1 < args.max_epoch:
-                evaluate_model(model, [train_loaders, val_loader],
-                               ['Training', 'Validation'],
-                               test_criterion, args, epoch)
-
-                print(f'Experiment name: {args.experiment_name}')
-                contrastive_dataloader = load_contrastive_data(train_loaders,
-                                                               slice_anchors,
-                                                               slice_negatives,
-                                                               positives_by_class,
-                                                               epoch + 1 + args.seed,
-                                                               args)
-            else:
-                if args.finetune_epochs > 0:
-                    dataloaders = (train_loaders, val_loader, test_loader)
-                    model = finetune_model(encoder, criterion,
-                                           test_criterion, dataloaders,
-                                           erm_models, args)
-
-                args.model_type = 'final'
-                run_final_evaluation(model, test_loader, test_criterion,
-                                     args, epoch, visualize_representation=True)
-
-                print('Done training')
-                print(f'- Experiment name: {args.experiment_name}')
-                print_header(f'Max Robust Acc:')
-                print(f'Acc: {args.max_robust_acc}')
-                print(f'Epoch: {args.max_robust_epoch}')
-                summarize_acc(args.max_robust_group_acc[0],
-                              args.max_robust_group_acc[1])
-
-
+        best_state, history = train_devil_net(
+            model=model,
+            erm_models=erm_models,
+            train_loaders=slice_outputs,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args
+        )
+ 
 if __name__ == '__main__':
     main()
