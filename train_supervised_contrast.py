@@ -7,49 +7,45 @@ from sched import scheduler
 import sys
 import copy
 import argparse
-import importlib
+import torch.nn as nn
 
 import torch
-import torch.nn.functional as f
-import pandas as pd
+import torch.nn.functional as F
 import numpy as np
-import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
 
-from PIL import Image
 from tqdm import tqdm
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 # Data
-from torch.utils.data import DataLoader, SequentialSampler, SubsetRandomSampler
 from datasets import train_val_split, get_resampled_indices, get_resampled_set, initialize_data
 # Logging and training
-from train import train_model, test_model
-from evaluate import evaluate_model, run_final_evaluation
 # , update_contrastive_experiment_name
-from utils import free_gpu, print_header
-from utils import init_experiment, init_args, update_args
+from utils import print_header
 from utils.logging import Logger, log_args, summarize_acc, initialize_csv_metrics, log_data
-from utils.visualize import plot_confusion, plot_data_batch
-from utils.metrics import compute_resampled_mutual_info, compute_mutual_info_by_slice
 # Model
-from network import get_net, get_optim, get_criterion, load_pretrained_model, save_checkpoint
-from network import get_output, backprop_, get_bert_scheduler, _get_linear_schedule_with_warmup
-# U-MAPS
-from activations import visualize_activations
+from network import get_net, get_optim, get_criterion, load_pretrained_model
+
 # Contrastive
-from contrastive_supervised_loader import prepare_contrastive_points, load_contrastive_data, adjust_num_pos_neg_
-from contrastive_network import DEFAULT_WEIGHTS, ContrastiveNet, load_encoder_state_dict, compute_outputs
+from contrastive_network import DEFAULT_WEIGHTS, ContrastiveNet, load_encoder_state_dict
 from contrastive_network import DevilNetLoss
-from slice import compute_pseudolabels, compute_slice_indices, train_spurious_model
+from slice import train_spurious_model
 # Alternative slicing by UMAP clustering
-from slice_rep import compute_devil_net_signals, compute_slice_indices_by_rep, combine_data_indices
+from slice_rep import compute_devil_net_signals
 
 import transformers
 transformers.logging.set_verbosity_error()
 
-import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
+class IndexedDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        return (*data, idx)   # append global index to whatever the dataset returns
 
 def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
     """
@@ -208,61 +204,9 @@ def compute_slice_outputs(erm_models, train_loaders, args):
     return sliced_outputs, train_loaders, loss_fn
 
 
-def finetune_model(encoder, criterion, test_criterion, dataloaders,
-                   erm_models, args):
-    """
-    Instead of joint training, finetune classifier
-    """
-    train_loaders, val_loader, test_loader = dataloaders
-    model = get_net(args)
-    state_dict = encoder.to(torch.device('cpu')).state_dict()
-    model = load_encoder_state_dict(model, state_dict)
-    args.model_type = 'finetune'
-    if args.freeze_encoder:
-        for name, param in model.named_parameters():
-            if name not in ['fc.weight', 'fc.bias',
-                            'backbone.fc.weight',
-                            'backbone.fc.bias']:
-                param.requires_grad = False
-        # Extra checking
-        params = list(filter(lambda p: p.requires_grad,
-                             model.parameters()))
-        assert len(params) == 2
-        for name, param in model.named_parameters():
-            if param.requires_grad is True:
-                print(name)
-        args.model_type += f'-fe'
-
-    optim = get_optim(model, args, model_type='classifier')
-    erm_models.to(args.device)
-    erm_models.eval()
-    slice_outputs = compute_slice_outputs(erm_models,
-                                          train_loaders,
-                                          args)
-    sliced_outputs, train_loaders, loss_fn = slice_outputs
-    erm_models.to(torch.device('cpu'))
-    indices = np.hstack(sliced_data_indices)
-    heading = f'Finetuning on aggregated slices'
-    print('-' * len(heading))
-    print(heading)
-    sliced_val_loader = val_loader
-    sliced_train_sampler = SubsetRandomSampler(indices)
-    sliced_train_loaders= DataLoader(train_loaders.dataset,
-                                     batch_size=args.bs_trn,
-                                     sampler=sliced_train_sampler,
-                                     num_workers=args.num_workers)
-    args.model_type = '2s2s_ss'
-    outputs = train_model(model, optim, criterion,
-                          sliced_train_loaders,
-                          sliced_val_loader, args, 0,
-                          args.finetune_epochs, True,
-                          test_loader, test_criterion)
-    model, max_robust_metrics, all_acc = outputs
-    return model
-
 
 def train_devil_net(model, erm_models, train_loaders, val_loader, test_loader,
-                    optimizer, scheduler, args, save_activations_fn,
+                    optimizer, scheduler, args,
                     group_labels_val=None, group_labels_test=None):
     """
     Full Devil-NET training loop.
@@ -520,11 +464,6 @@ def main():
             
         
     # load_dataloaders, visualize_dataset = initialize_data(args)
-    if args.resample_class != '':
-        if args.resample_class == 'upsample':
-            sample += '-rsc=u'
-        elif args.resample_class == 'subsample':
-            sample += '-rsc=s'
 
     #init_args(args)
     #update_args(args)
@@ -550,7 +489,24 @@ def main():
 
     train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
         # train_loaders is a list of N loaders, one per bias model partition
-
+        
+    # Extract group labels for worst-group evaluation
+    # These come from the dataset's metadata_array — column 0 is the group id
+    # Works for Waterbirds, CelebA, CivilComments, CXR (all bias benchmarks)
+    def get_group_labels(loader):
+        dataset = loader.dataset
+        # Unwrap Subset if needed
+        if hasattr(dataset, 'dataset'):
+            dataset = dataset.dataset
+        if hasattr(dataset, 'metadata_array'):
+            return dataset.metadata_array[:, 0].numpy().astype(np.int64)
+        elif hasattr(dataset, '_metadata_array'):
+            return dataset._metadata_array[:, 0].numpy().astype(np.int64)
+        else:
+            return None   # standard dataset — no group labels, evaluate() falls back to avg_acc
+    
+    group_labels_val  = get_group_labels(val_loader)
+    group_labels_test = get_group_labels(test_loader)
 
     if args.resample_class != '':
         resampled_indices = get_resampled_indices(dataloader=train_loaders,
@@ -620,18 +576,21 @@ def main():
                 model.fc = classifier
             except:
                 model.classifier = classifier
-        run_final_evaluation(model, test_loader, test_criterion,
-                             args, epoch=start_epoch,
-                             visualize_representation=True)
 
-        print('Done training')
-        print(f'- Experiment name: {args.experiment_name}')
-        print_header(f'Max Robust Acc:')
-        print(f'Acc: {args.max_robust_acc}')
-        print(f'Epoch: {args.max_robust_epoch}')
-        summarize_acc(args.max_robust_group_acc[0],
-                      args.max_robust_group_acc[1])
-        return
+
+        test_results = evaluate(
+                    model=model,
+                    dataloader=test_loader,
+                    args=args,
+                    group_labels=group_labels_test,
+                )
+
+        print(f'Test avg accuracy:  {test_results["avg_acc"]*100:.2f}%')
+        if 'worst_group' in test_results:
+            print(f'Test worst-group:   {test_results["worst_group"]*100:.2f}%')
+            for g, acc in test_results['group_accs'].items():
+                print(f'  Group {g}: {acc*100:.2f}%')
+
 
     # -------------------
     # Slice training data
@@ -675,6 +634,9 @@ def main():
         # -------------
         # Train encoder
         # -------------
+        net = get_net(args)
+        
+        optimizer= get_optim(net, args, model_type='main')
         best_state, history = train_devil_net(
             model=model,
             erm_models=erm_models,
@@ -683,7 +645,9 @@ def main():
             test_loader=test_loader,
             optimizer=optimizer,
             scheduler=scheduler,
-            args=args
+            args=args,
+            group_labels_val=group_labels_val,
+            group_labels_test=group_labels_test
         )
  
 if __name__ == '__main__':

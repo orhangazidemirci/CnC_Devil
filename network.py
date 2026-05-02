@@ -82,73 +82,6 @@ def get_net(args, pretrained=None):
     return net
 
 
-def get_output(model, inputs, labels, args):
-    """
-    General method for BERT and non-BERT model inference
-    - Model and data batch should be passed already
-    
-    Args:
-    - model (torch.nn.Module): Pytorch network
-    - inputs (torch.tensor): Data features batch
-    - labels (torch.tensor): Data labels batch
-    - args (argparse): Experiment args
-    """
-    if args.arch == 'bert-base-uncased_pt':
-        input_ids   = inputs[:, :, 0]
-        input_masks = inputs[:, :, 1]
-        segment_ids = inputs[:, :, 2]
-        outputs = model(input_ids=input_ids,
-                        attention_mask=input_masks,
-                        token_type_ids=segment_ids,
-                        labels=labels)
-        if labels is None:
-            return outputs.logits
-        return outputs[1]  # [1] returns logits
-        # passing this into cross_entropy_loss gets a different loss
-#     elif 'bert' in args.arch:
-#         input_ids   = inputs[:, :, 0]
-#         input_masks = inputs[:, :, 1]
-#         segment_ids = inputs[:, :, 2]
-#         outputs = model(input_ids=input_ids,
-#                         attention_mask=input_masks,
-#                         token_type_ids=segment_ids,
-#                         labels=labels)
-#         return outputs[1]
-    else:
-        return model(inputs)
-
-
-def backprop_(model, optimizer, train_stage, args, scheduler=None):
-    """
-    General method for BERT and non-BERT backpropogation step
-    - loss.backward() should already be called
-    
-    Args:
-    - model (torch.nn.Module): Pytorch network
-    - optimizer (torch.optim): Pytorch network's optimizer
-    - train_stage (str): Either 'spurious', 'contrastive', 'grad_align'
-    - args (argparse): Experiment args
-    - scheduler (torch.optim.lr_scheduler): Learning rate scheduler
-    """
-    if train_stage == 'grad_align':
-        clip_grad_norm = args.grad_clip_grad_norm
-    else:
-        clip_grad_norm = args.clip_grad_norm
-        
-    if args.arch == 'bert-base-uncased_pt' and args.optim == 'AdamW':
-        if clip_grad_norm:
-            torch.nn.utils.clip_grad_norm_(model.parameters(),
-                                           args.max_grad_norm)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        model.zero_grad()
-    else:
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        optimizer.zero_grad()
-    
 
 def load_pretrained_model(path, args):
     checkpoint = torch.load(path)
@@ -216,97 +149,194 @@ def save_checkpoint(model, optim, loss, epoch, batch, args,
     del save_dict
     return fname
 
+import torch.optim as optim
 
-def get_optim(net, args, model_type='pretrain', 
-              scheduler_lr=None):
+
+def get_optim(net, args, model_type='main', scheduler_lr=None):
+    """
+    Build optimizer for a given model type.
+
+    model_type:
+        'main'       — main Devil-NET encoder+classifier
+                       uses two parameter groups: encoder (weight_decay)
+                       vs classifier (weight_decay_c)
+        'spurious'   — stage 1 bias model
+                       uses lr_s / momentum_s / weight_decay_s
+        'classifier' — standalone linear classifier head only
+                       uses lr / momentum / weight_decay_c
+
+    Args:
+        net          : nn.Module
+        args         : args namespace
+        model_type   : str (see above)
+        scheduler_lr : float or None — overrides lr when provided (for LR schedulers)
+
+    Returns:
+        optimizer : torch.optim.Optimizer
+    """
+
+    # ------------------------------------------------------------------
+    # Select hyperparameters by model type
+    # ------------------------------------------------------------------
     if model_type == 'spurious':
-        lr = args.lr_s
-        momentum = args.momentum_s
+        lr           = args.lr_s
+        momentum     = args.momentum_s
         weight_decay = args.weight_decay_s
-        adam_epsilon = args.adam_epsilon_s
+
     elif model_type == 'classifier':
-        # Repurposed for classifier
-        lr = args.lr
-        momentum = args.momentum
+        lr           = args.lr if scheduler_lr is None else scheduler_lr
+        momentum     = args.momentum
         weight_decay = args.weight_decay_c
-        adam_epsilon = args.adam_epsilon
-    else:
-        lr = args.lr if scheduler_lr is None else scheduler_lr
-        momentum = args.momentum
+
+    else:  # 'main'
+        lr           = args.lr if scheduler_lr is None else scheduler_lr
+        momentum     = args.momentum
         weight_decay = args.weight_decay
-        adam_epsilon = args.adam_epsilon
-        
+
+    # ------------------------------------------------------------------
+    # Build optimizer
+    # ------------------------------------------------------------------
     if args.optim == 'sgd':
-        optimizer = optim.SGD(net.parameters(),
-                              lr=lr,
-                              momentum=momentum,
-                              weight_decay=weight_decay)
-        
+        if model_type == 'main':
+            # Two parameter groups: encoder and classifier regularized separately
+            optimizer = optim.SGD(
+                _two_group_params(net, args),
+                lr=lr,
+                momentum=momentum,
+            )
+        else:
+            optimizer = optim.SGD(
+                net.parameters(),
+                lr=lr,
+                momentum=momentum,
+                weight_decay=weight_decay,
+            )
+
     elif args.optim == 'adam':
-        optimizer = optim.Adam(net.parameters(),
-                               lr=lr,
-                               betas=(0.9, 0.999), 
-                               eps=1e-08,
-                               weight_decay=weight_decay,
-                               amsgrad=False)
+        if model_type == 'main':
+            optimizer = optim.Adam(
+                _two_group_params(net, args),
+                lr=lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+            )
+        else:
+            optimizer = optim.Adam(
+                net.parameters(),
+                lr=lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=weight_decay,
+            )
 
     elif args.optim == 'AdamW':
+        # AdamW: no weight decay on bias and LayerNorm (standard for BERT)
         no_decay = ['bias', 'LayerNorm.weight']
-        optimizer_grouped_parameters = [
-            {'params': [p for n, p in net.named_parameters() 
-                        if not any(nd in n for nd in no_decay)], 
-             'weight_decay': args.weight_decay},
-            {'params': [p for n, p in net.named_parameters() 
-                        if any(nd in n for nd in no_decay)], 
-             'weight_decay': 0.0}]
-        optimizer = optim.AdamW(optimizer_grouped_parameters,
-                                lr=lr, eps=adam_epsilon)
+
+        if model_type == 'main':
+            # Four groups: (encoder / classifier) × (decay / no-decay)
+            optimizer_params = [
+                {
+                    'params': [p for n, p in net.named_parameters()
+                               if _is_encoder(n, net)
+                               and not any(nd in n for nd in no_decay)],
+                    'weight_decay': args.weight_decay,
+                    'lr': lr,
+                },
+                {
+                    'params': [p for n, p in net.named_parameters()
+                               if _is_encoder(n, net)
+                               and any(nd in n for nd in no_decay)],
+                    'weight_decay': 0.0,
+                    'lr': lr,
+                },
+                {
+                    'params': [p for n, p in net.named_parameters()
+                               if not _is_encoder(n, net)
+                               and not any(nd in n for nd in no_decay)],
+                    'weight_decay': args.weight_decay_c,
+                    'lr': lr,
+                },
+                {
+                    'params': [p for n, p in net.named_parameters()
+                               if not _is_encoder(n, net)
+                               and any(nd in n for nd in no_decay)],
+                    'weight_decay': 0.0,
+                    'lr': lr,
+                },
+            ]
+            # Drop empty groups
+            optimizer_params = [g for g in optimizer_params if g['params']]
+        else:
+            optimizer_params = [
+                {
+                    'params': [p for n, p in net.named_parameters()
+                               if not any(nd in n for nd in no_decay)],
+                    'weight_decay': weight_decay,
+                },
+                {
+                    'params': [p for n, p in net.named_parameters()
+                               if any(nd in n for nd in no_decay)],
+                    'weight_decay': 0.0,
+                },
+            ]
+
+        optimizer = optim.AdamW(optimizer_params, lr=lr, eps=1e-8)
+
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Optimizer '{args.optim}' not supported. "
+                                  f"Choose from: sgd, adam, AdamW")
+
     return optimizer
 
 
-def get_bert_scheduler(optimizer, n_epochs, warmup_steps, dataloader, last_epoch=-1):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _two_group_params(net, args):
     """
-    Learning rate scheduler for BERT model training
+    Split net parameters into two groups:
+      - encoder parameters : weight_decay
+      - classifier parameters : weight_decay_c
     """
-    num_training_steps = int(np.round(len(dataloader) * n_epochs))
-    print(f'\nt_total is {num_training_steps}\n')
-    scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                warmup_steps,
-                                                num_training_steps,
-                                                last_epoch)
-    return scheduler
+    encoder_params    = []
+    classifier_params = []
 
-# From pytorch-transformers:
-def _get_linear_schedule_with_warmup(optimizer, num_warmup_steps,
-                                     num_training_steps, last_epoch=-1):
+    for name, param in net.named_parameters():
+        if _is_encoder(name, net):
+            encoder_params.append(param)
+        else:
+            classifier_params.append(param)
+
+    groups = []
+    if encoder_params:
+        groups.append({'params': encoder_params,    'weight_decay': args.weight_decay})
+    if classifier_params:
+        groups.append({'params': classifier_params, 'weight_decay': args.weight_decay_c})
+
+    # Fallback: if split failed (unusual architecture), use all params
+    if not groups:
+        groups = [{'params': list(net.parameters()), 'weight_decay': args.weight_decay}]
+
+    return groups
+
+
+def _is_encoder(param_name, net):
     """
-    Create a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0, after
-    a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
-
-    Args:
-        optimizer (:class:`~torch.optim.Optimizer`):
-            The optimizer for which to schedule the learning rate.
-        num_warmup_steps (:obj:`int`):
-            The number of steps for the warmup phase.
-        num_training_steps (:obj:`int`):
-            The total number of training steps.
-        last_epoch (:obj:`int`, `optional`, defaults to -1):
-            The index of the last epoch when resuming training.
-
-    Return:
-        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    Returns True if param_name belongs to the encoder (not the classifier head).
+    Checks common classifier head naming conventions.
     """
+    classifier_keywords = ('classifier', 'fc', 'head', 'linear')
 
-    def lr_lambda(current_step: int):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        return max(
-            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
-        )
+    # If the model explicitly declares activation_layer, use that as boundary
+    if hasattr(net, 'activation_layer'):
+        return not any(kw in param_name for kw in classifier_keywords)
 
-    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+    # Generic fallback: anything named 'classifier', 'fc', 'head', 'linear'
+    # at the top level is the classifier
+    top_level = param_name.split('.')[0]
+    return top_level not in classifier_keywords
 
 
 def get_criterion(args, reduction='mean'):
