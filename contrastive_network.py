@@ -183,77 +183,278 @@ class ContrastiveNet(nn.Module):
             return self.forward(x)
     
 
-class SupervisedContrastiveLoss(nn.Module):
-    def __init__(self, args):
-        super(SupervisedContrastiveLoss, self).__init__()
-        self.temperature = args.temperature
-        self.n_positives = args.num_positive
-        self.n_negatives = args.num_negative
-        self.arch = args.arch
-        self.args = args
-        self.hard_neg_factor = args.hard_negative_factor
-        try:
-            self.single_pos = args.single_pos
-        except:
-            self.single_pos = False
-        
+"""
+DevilNetLoss — Devil-NET contrastive loss
+==========================================
+
+Mirrors the structure of SupervisedContrastiveLoss but replaces
+the single-model contrastive batch with Angel/Devil dual signals:
+
+  Original CnC:
+    sim(f(anchor), f(positive))   ← both run through same model
+    sim(f(anchor), f(negative))
+
+  Devil-NET:
+    sim(z, z_angel_j)  for positives  ← z = f_enc(anchor), z_angel = Angel_enc(x_j)
+    sim(z, z_devil_j)  for negatives  ← z_devil = Devil_enc(x_j)
+
+  Self signal (Table 1):
+    sim(z, z_angel_self)  ← pull anchor toward its own Angel representation
+    sim(z, z_devil_self)  ← push anchor away from its own Devil representation
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy.stats import mode
+
+
+DEFAULT_WEIGHTS = {
+    # Table 1 — self signal
+    'w1': 0.7,   # TT: angel_pos only
+    'w2': 1.0,   # TF: angel_pos component
+    'w3': 1.0,   # TF: devil_neg component
+    'w4': 0.5,   # FF: devil_neg
+    'w5': 0.1,   # FT: devil_neg (conservative)
+    # Table 2 — batch positives
+    'w_A': 1.0,  # hard  (same class, diff angel pred, diff devil pred)
+    'w_B': 0.7,  # soft  (same class, same angel pred, diff devil pred)
+    'w_C': 0.3,  # easy  (same class, same angel pred, same devil pred)
+    # Table 2 — batch negatives
+    'w_E': 1.0,  # hard  (diff class, diff angel pred, same devil pred)
+    'w_F': 0.7,  # soft  (diff class, same angel pred, same devil pred)
+}
+
+
+class DevilNetLoss(nn.Module):
+    """
+    Args:
+        signals     : dict output of compute_devil_net_signals(), containing:
+                        angel_predictions (N,), devil_predictions (N,),
+                        angel_embeddings (N, D), devil_embeddings (N, D), targets (N,)
+        weights     : dict of loss weights (see DEFAULT_WEIGHTS)
+        temperature : contrastive temperature τ
+        alpha       : scale of self loss relative to total
+        beta        : scale of batch contrastive loss relative to total
+    """
+
+    def __init__(self, signals: dict, weights: dict = None,
+                 temperature: float = 0.07, alpha: float = 1.0, beta: float = 1.0,
+                 hard_neg_factor: float = 0.0):
+        """
+        hard_neg_factor : if > 0, dynamically upweights negatives the model already
+                          finds similar to the anchor (most confused pairs contribute more).
+                          Set to 0 to disable (default). Mirrors CnC's hard_negative_factor.
+        """
+        super().__init__()
+        self.tau             = temperature
+        self.alpha           = alpha
+        self.beta            = beta
+        self.hard_neg_factor = hard_neg_factor
+        self.w               = DEFAULT_WEIGHTS.copy()
+        if weights:
+            self.w.update(weights)
+
         self.sim = nn.CosineSimilarity(dim=1)
-        
-    def forward(self, model, contrastive_batch):
-        # Compute negative similarities
-        neg_indices = [0] + list(range(len(contrastive_batch))[
-            -self.n_negatives:])
-        anchor_negatives = contrastive_batch[neg_indices]
-        exp_neg = self.compute_exp_sim(model, anchor_negatives,
-                                       return_sum=False)
-        # Hard negative reweighting - by default ignore
-        if self.hard_neg_factor > 0:
-            # exp_neg.mean() because N * E[... exp / sum_n] 
-            reweight = self.hard_neg_factor * exp_neg / exp_neg.mean()
-            sum_exp_neg = (reweight * exp_neg).sum(0, keepdim=True)
-            sum_exp_neg *= self.args.num_negatives_by_target[
-                self.target_class]
-        else:
-            sum_exp_neg = exp_neg.sum(0, keepdim=True)
-            
-        # Compute positive similarities
-        anchor_positives = contrastive_batch[:1 + self.n_positives]
-        exp_pos = self.compute_exp_sim(model, anchor_positives, 
-                                       return_sum=False)
-        
-        if self.single_pos:
-            log_probs = torch.log(exp_pos) - torch.log(sum_exp_neg + exp_pos)
-        else:
-            log_probs = (torch.log(exp_pos) - 
-                         torch.log(sum_exp_neg + exp_pos.sum(0, keepdim=True)))
-        loss = -1 * log_probs
-        del exp_pos; del exp_neg; del log_probs
+
+        # Store signals — moved to device on first forward call
+        self.angel_pred = torch.from_numpy(signals['angel_predictions'].astype(np.int64))
+        self.devil_pred = torch.from_numpy(signals['devil_predictions'].astype(np.int64))
+        self.targets    = torch.from_numpy(signals['targets'].astype(np.int64))
+
+        # Pre-normalize embeddings once — shape (N, D)
+        self.angel_emb = F.normalize(
+            torch.from_numpy(signals['angel_embeddings'].astype(np.float32)), dim=1)
+        self.devil_emb = F.normalize(
+            torch.from_numpy(signals['devil_embeddings'].astype(np.float32)), dim=1)
+
+        self._on_device = False
+
+    # ------------------------------------------------------------------
+    # Device management
+    # ------------------------------------------------------------------
+
+    def _to_device(self, device):
+        if not self._on_device:
+            self.angel_pred = self.angel_pred.to(device)
+            self.devil_pred = self.devil_pred.to(device)
+            self.targets    = self.targets.to(device)
+            self.angel_emb  = self.angel_emb.to(device)
+            self.devil_emb  = self.devil_emb.to(device)
+            self._on_device = True
+
+    # ------------------------------------------------------------------
+    # Table 1 — self loss
+    # Mirrors compute_exp_sim but for self-alignment:
+    #   angel_pos: pull z toward z_angel of the same sample
+    #   devil_neg: push z away from z_devil of the same sample
+    # ------------------------------------------------------------------
+
+    def compute_self_loss(self, idx: torch.Tensor, z: torch.Tensor):
+        """
+        Args:
+            idx : (B,) dataset indices for this batch
+            z   : (B, D) L2-normalized f_enc embeddings
+
+        Returns scalar self loss.
+        """
+        w = self.w
+
+        # Classify each sample by Table 1 case
+        angel_correct = self.angel_pred[idx] == self.targets[idx]   # (B,)
+        devil_correct = self.devil_pred[idx]  == self.targets[idx]   # (B,)
+
+        TT =  angel_correct &  devil_correct
+        TF =  angel_correct & ~devil_correct
+        FF = ~angel_correct & ~devil_correct
+        FT = ~angel_correct &  devil_correct
+
+        # cos sim between anchor z and its own angel/devil embeddings
+        angel_sim = self.sim(z, self.angel_emb[idx])   # (B,)
+        devil_sim  = self.sim(z, self.devil_emb[idx])  # (B,)
+
+        loss = torch.zeros(len(idx), device=z.device)
+        loss[TT]  = -w['w1'] * angel_sim[TT]
+        loss[TF]  = -w['w2'] * angel_sim[TF] + w['w3'] * devil_sim[TF]
+        loss[FF]  =  w['w4'] * devil_sim[FF]
+        loss[FT]  =  w['w5'] * devil_sim[FT]   # conservative — devil correct but on seen data
+
         return loss.mean()
-    
-    def compute_exp_sim(self, model, features, return_sum=True):
+
+    # ------------------------------------------------------------------
+    # Table 2 — batch contrastive loss
+    # Mirrors forward() of SupervisedContrastiveLoss:
+    #   exp_pos[i,j] = exp(sim(z_i, z_angel_j) / τ)  for j in positives of i
+    #   exp_neg[i,j] = exp(sim(z_i, z_devil_j) / τ)  for j in negatives of i
+    #   loss_i = -log( Σ w_pos·exp_pos / (Σ w_pos·exp_pos + Σ w_neg·exp_neg) )
+    # ------------------------------------------------------------------
+
+    def _pair_weights(self, idx: torch.Tensor):
         """
-        Compute sum(sim(anchor, pos)) or sum(sim(anchor, neg))
+        Build (B, B) positive and negative weight matrices from Table 2 rules.
+        Returns pos_w, neg_w — zero means the pair is skipped.
         """
-        features = features.to(self.args.device)
-        if self.arch == 'bert-base-uncased_pt':
-            input_ids   = features[:, :, 0]
-            input_masks = features[:, :, 1]
-            segment_ids = features[:, :, 2]
-            outputs = model((input_ids, input_masks, segment_ids, None))
+        w = self.w
+        y = self.targets[idx]     # (B,)
+        a = self.angel_pred[idx]  # (B,)
+        d = self.devil_pred[idx]  # (B,)
+
+        same_class = y.unsqueeze(1) == y.unsqueeze(0)   # (B, B)
+        same_angel = a.unsqueeze(1) == a.unsqueeze(0)   # (B, B)
+        same_devil = d.unsqueeze(1) == d.unsqueeze(0)   # (B, B)
+
+        # --- Table 2 positives (same class) ---
+        case_A = same_class & ~same_angel & ~same_devil   # hard
+        case_B = same_class &  same_angel & ~same_devil   # soft
+        case_C = same_class &  same_angel &  same_devil   # easy
+        # case_D (same_class & diff_angel & same_devil) → conflict, skip
+
+        pos_w = torch.zeros(len(idx), len(idx), device=y.device)
+        pos_w[case_A] = w['w_A']
+        pos_w[case_B] = w['w_B']
+        pos_w[case_C] = w['w_C']
+
+        # --- Table 2 negatives (different class) ---
+        diff_class = ~same_class
+        case_E = diff_class & ~same_angel &  same_devil   # hard
+        case_F = diff_class &  same_angel &  same_devil   # soft
+        # case_G (diff_class & diff_angel & diff_devil) → naturally separated, skip
+        # case_H (diff_class & same_angel & diff_devil) → noise, skip
+
+        neg_w = torch.zeros(len(idx), len(idx), device=y.device)
+        neg_w[case_E] = w['w_E']
+        neg_w[case_F] = w['w_F']
+
+        # Exclude self-pairs
+        diag = torch.eye(len(idx), dtype=torch.bool, device=y.device)
+        pos_w[diag] = 0.
+        neg_w[diag] = 0.
+
+        return pos_w, neg_w
+
+    def compute_batch_loss(self, idx: torch.Tensor, z: torch.Tensor):
+        """
+        Args:
+            idx : (B,) dataset indices
+            z   : (B, D) L2-normalized f_enc embeddings
+
+        Returns scalar batch contrastive loss.
+        """
+        B = len(idx)
+
+        pos_w, neg_w = self._pair_weights(idx)   # (B, B)
+
+        # Similarity matrices — mirrors compute_exp_sim
+        #   sim_pos[i, j] = sim(z_i, z_angel_j)  — anchor vs Angel of partner
+        #   sim_neg[i, j] = sim(z_i, z_devil_j)  — anchor vs Devil of partner
+        z_angel_batch = self.angel_emb[idx]   # (B, D)
+        z_devil_batch = self.devil_emb[idx]   # (B, D)
+
+        sim_pos = torch.mm(z, z_angel_batch.t()) / self.tau   # (B, B)
+        sim_neg = torch.mm(z, z_devil_batch.t()) / self.tau   # (B, B)
+
+        exp_pos = torch.exp(sim_pos)   # (B, B)
+        exp_neg = torch.exp(sim_neg)   # (B, B)
+
+        # Weighted sums per anchor row
+        sum_exp_pos = (pos_w * exp_pos).sum(dim=1)   # (B,)
+
+        # Optional dynamic hard negative reweighting (flag: hard_neg_factor > 0)
+        # Upweights negatives the model already finds similar — most confused pairs
+        # contribute more to the denominator, sharpening the repulsion signal.
+        # Mirrors CnC's hard_negative_factor logic: reweight = k * exp_neg / mean(exp_neg)
+        if self.hard_neg_factor > 0:
+            # Only reweight over actual negative positions (neg_w > 0)
+            neg_mask      = neg_w > 0                                      # (B, B)
+            mean_exp_neg  = (exp_neg * neg_mask).sum(dim=1, keepdim=True) \
+                            / neg_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1)
+            reweight      = self.hard_neg_factor * exp_neg / (mean_exp_neg + 1e-8)
+            sum_exp_neg   = (neg_w * reweight * exp_neg).sum(dim=1)        # (B,)
         else:
-            outputs = model(features)
-        
-        sim = self.sim(outputs[0].view(1, -1), outputs[1:])
-        exp_sim = torch.exp(torch.div(sim, self.temperature))
-        # Should not detach from graph
-        features = features.to(torch.device('cpu'))
-        outputs = outputs.to(torch.device('cpu'))
-        if return_sum:
-            sum_exp_sim = exp_sim.sum(0, keepdim=True)
-            exp_sim.detach_().cpu(); del exp_sim
-            return sum_exp_sim
-        return exp_sim
+            sum_exp_neg = (neg_w * exp_neg).sum(dim=1)                     # (B,)
+
+        # Only compute loss for anchors that have at least one positive and one negative
+        valid = (sum_exp_pos > 0) & (sum_exp_neg > 0)
+
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=z.device)
+
+        # -log( sum_exp_pos / (sum_exp_pos + sum_exp_neg) )  — mirrors original log_probs
+        log_probs = torch.log(sum_exp_pos[valid]) - \
+                    torch.log(sum_exp_pos[valid] + sum_exp_neg[valid])
+        loss = -log_probs
+
+        del exp_pos, exp_neg, log_probs
+        return loss.mean()
+
+    # ------------------------------------------------------------------
+    # Forward — mirrors SupervisedContrastiveLoss.forward()
+    # ------------------------------------------------------------------
+
+    def forward(self, idx: torch.Tensor, z_raw: torch.Tensor):
+        """
+        Args:
+            idx   : (B,) LongTensor — dataset indices for this batch
+            z_raw : (B, D) FloatTensor — raw f_enc outputs (normalized internally)
+
+        Returns:
+            total_loss : scalar — alpha*self_loss + beta*batch_loss
+            self_loss  : scalar
+            batch_loss : scalar
+        """
+        self._to_device(z_raw.device)
+
+        z = F.normalize(z_raw, dim=1)   # (B, D) — normalize once, use everywhere
+
+        self_loss  = self.compute_self_loss(idx, z)
+        batch_loss = self.compute_batch_loss(idx, z)
+
+        total = self.alpha * self_loss + self.beta * batch_loss
+        return total, self_loss, batch_loss
     
+
+
     
 def compute_outputs(inputs, encoder, classifier, args, 
                     labels=None, compute_loss=False,

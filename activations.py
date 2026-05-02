@@ -29,134 +29,42 @@ class SaveOutput:
         self.outputs = []
 
 
-def save_activations(model, dataloader, args, model_idx):
+def save_activations(model, dataloader, args):
     """
-    total_embeddings = save_activations(net, train_loader, args)
+    Returns:
+        embeddings  : np.ndarray (N, D) — mid-layer features
+        predictions : np.ndarray (N,)  — predicted class indices
     """
-    save_output = SaveOutput()
-    hook_handles = []
+    save_output  = SaveOutput()
+    target_layer = dict(model.named_modules()).get(model.activation_layer)
 
-    if 'resnet' in args.arch:
-        for name, layer in model.named_modules():
-            if name == model.activation_layer or \
-                (isinstance(model, torch.nn.DataParallel) and \
-                 name.replace('module.', '') == model.activation_layer):
-                handle = layer.register_forward_hook(save_output)
-                hook_handles.append(handle)
-    elif 'densenet' in args.arch:
-        for name, layer in model.named_modules():
-            if name == model.activation_layer or \
-                (isinstance(model, torch.nn.DataParallel) and \
-                 name.replace('module.', '') == model.activation_layer):
-                handle = layer.register_forward_hook(save_output)
-                hook_handles.append(handle)
-    elif 'bert' in args.arch:
-        for name, layer in model.named_modules():
-            if name == model.activation_layer or \
-                (isinstance(model, torch.nn.DataParallel) and \
-                 name.replace('module.', '') == model.activation_layer):
-                handle = layer.register_forward_hook(save_output)
-                hook_handles.append(handle)
-                print(f'Activation layer: {name}')
-    else:
-        # Only get last activation layer that fits the criteria?
-        activation_layers = []
-        for layer in model.modules():
-#         for name, layer in model.named_modules()
-            try:
-                if isinstance(layer, torch.nn.ReLU) or isinstance(layer, torch.nn.Identity):
-                    activation_layers.append(layer)
-#                     handle = layer.register_forward_hook(save_output)
-#                     hook_handles.append(handle)
-            except AttributeError:
-                if isinstance(layer, torch.nn.ReLU):
-                    activation_layers.append(layer)
-#                     handle = layer.register_forward_hook(save_output)
-#                     hook_handles.append(handle)
-        # Only get last activation layer that fits the criteria
-        if 'cnn' in args.arch and args.no_projection_head is False: 
-#                                    or args.dataset == 'colored_mnist'):
-            handle = activation_layers[-2].register_forward_hook(save_output)
-        else:
-            handle = activation_layers[-1].register_forward_hook(save_output)
-        hook_handles.append(handle) 
+    if target_layer is None:
+        raise ValueError(f"Layer '{model.activation_layer}' not found in model.")
+
+    handle = target_layer.register_forward_hook(save_output)
+
     model.to(args.device)
     model.eval()
-
-    # Forward pass on test set to save activations
-    correct_train = 0
-    total_train = 0
-    total_embeddings = []
-    total_inputs = []
-    total_labels = []
-    
-    total_predictions = []
-
-    print('> Saving activations')
+    predictions = []
 
     with torch.no_grad():
-        for i, data in enumerate(tqdm(dataloader, desc='Running inference')):
-            inputs, labels, data_ix = data
-            inputs = inputs.to(args.device)
-            labels = labels.to(args.device)
-            
-            try:
-                if args.mode == 'contrastive_train':
-                    input_ids   = inputs[:, :, 0]
-                    input_masks = inputs[:, :, 1]
-                    segment_ids = inputs[:, :, 2]
-                    outputs = model((input_ids, input_masks, segment_ids, None))  # .logits <- changed this in the contrastive network definitino
-                else:
-                    outputs = get_output(model, inputs, labels, args)
-            except:
-                outputs = get_output(model, inputs, labels, args)
-            # Why was I collecting these? 4/27/21
-            # total_inputs.extend(inputs.detach().cpu().numpy())
-            # total_labels.extend(labels.detach().cpu().numpy())
+        for inputs, labels, _ in tqdm(dataloader, desc='Saving activations'):
+            inputs  = inputs.to(args.device)
+            outputs = get_output(model, inputs, labels, args)
+            _, pred = torch.max(outputs, 1)
+            predictions.append(pred.cpu())
 
-            _, predicted = torch.max(outputs.data, 1)
-            total_train += labels.size(0)
-            correct_train += (predicted == labels).sum().item()
-            
-            # Clear memory
-            inputs = inputs.detach().cpu()
-            labels = labels.detach().cpu()
-            outputs = outputs.detach().cpu()
-            predicted = predicted.detach().cpu()
-            total_predictions.append(predicted)
-            del inputs; del labels; del outputs; del predicted
+    embeddings  = np.concatenate([o.detach().cpu().numpy().squeeze()
+                                  for o in save_output.outputs])
+    predictions = np.concatenate(predictions)
 
-       #  print(f'Accuracy of the network on the test images: %d %%' % (
-       #      100 * correct_train / total_train))
-        
-    # Testing this
-    save_output.outputs = [so.detach() for so in save_output.outputs]
-    
-    total_predictions = np.concatenate(total_predictions)
-    # Consolidate embeddings
-    total_embeddings = [None] * len(save_output.outputs)
+    if embeddings.ndim > 2:
+        embeddings = embeddings.reshape(len(embeddings), -1)
 
-    for ix, output in enumerate(save_output.outputs):
-        total_embeddings[ix] = output.numpy().squeeze()
-        
-    # print(total_embeddings)
-        
-    if 'resnet' in args.arch or 'densenet' in args.arch or 'bert' in args.arch or 'cnn' in args.arch or 'mlp' in args.arch:
-        total_embeddings = np.concatenate(total_embeddings)
-        if len(total_embeddings.shape) > 2:  # Should just be (n_datapoints, embedding_dim)
-            total_embeddings = total_embeddings.reshape(len(total_embeddings), -1)
-        save_output.clear()
-        del save_output; del hook_handles
-        return total_embeddings, total_predictions
-    
-    total_embeddings_relu1 = np.concatenate(
-        [total_embeddings[0::2]], axis=0).reshape(-1, total_embeddings[0].shape[-1])
-    total_embeddings_relu2 = np.concatenate(
-        [total_embeddings[1::2]], axis=0).reshape(-1, total_embeddings[1].shape[-1])
-    
+    handle.remove()
     save_output.clear()
-    del save_output; del hook_handles
-    return total_embeddings_relu1, total_embeddings_relu2, total_predictions
+
+    return embeddings, predictions
 
 
 def visualize_activations(net, dataloader, label_types, num_data=None,
