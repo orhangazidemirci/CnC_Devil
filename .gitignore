@@ -7,3 +7,6 @@
 /logs/colored_mnist
 /logs
 /model
+waterbirds/
+model/
+*.pkl
