@@ -1,6 +1,7 @@
 """
 Datasets
 """
+
 import os
 import copy
 import pickle
@@ -273,14 +274,16 @@ def _initialize_devil(args, load_dataloaders, visualize_dataset):
 # ---------------------------------------------------------------------------
 
 def stratified_partition_for_bias_diversity(dataset, num_bias_models,
-                                             dataset_type='standard', seed=42):
+                                             dataset_type='standard',
+                                             base_bias=0.95, seed=42):
     np.random.seed(seed)
     has_groups = (hasattr(dataset, 'metadata_array') or
                   hasattr(dataset, '_metadata_array'))
 
     if dataset_type == 'bias_benchmark' and has_groups:
-        print('Using STRATIFIED partitioning (bias benchmark dataset)')
-        return _stratified_partition_with_groups(dataset, num_bias_models, seed)
+        print('Using PER-CLASS BIAS partitioning (bias benchmark dataset)')
+        return _stratified_partition_per_class_bias(
+            dataset, num_bias_models, base_bias=base_bias, seed=seed)
 
     print('Using RANDOM partitioning (standard dataset)')
     return _random_partition(len(dataset), num_bias_models, seed)
@@ -293,12 +296,31 @@ def _random_partition(num_total_samples, num_bias_models, seed):
     return [arr.tolist() for arr in np.array_split(all_indices, num_bias_models)]
 
 
-def _stratified_partition_with_groups(dataset, num_bias_models, seed):
+def _stratified_partition_per_class_bias(dataset, num_bias_models,
+                                          base_bias=0.95, seed=42):
     """
-    Partition dataset into N shards with linearly decreasing spurious bias ratios
-    (from 95% down to 50%), so each bias model trains on a differently biased view.
+    Partition into N shards where each class has an OPPOSITE bias trajectory.
+
+    For 2 classes (e.g. Waterbirds):
+      Partition 0: class 0 bias HIGH (0.99),  class 1 bias LOW  (0.91)
+      Partition N//2: class 0 bias = class 1 bias = base_bias (0.95)
+      Partition N-1: class 0 bias LOW  (0.91), class 1 bias HIGH (0.99)
+
+    The average bias across all partitions = base_bias for every class,
+    because the offsets are symmetric and sum to zero.
+
+    Group layout assumed (Waterbirds / CelebA convention):
+      group 2c   = spurious group of class c   (majority)
+      group 2c+1 = conflicting group of class c (minority)
+
+    e.g. Waterbirds:
+      group 0: landbird  on land  (spurious  for class 0)
+      group 1: landbird  on water (conflicting for class 0)
+      group 2: waterbird on water (spurious  for class 1)
+      group 3: waterbird on land  (conflicting for class 1)
     """
     np.random.seed(seed)
+    N = num_bias_models
 
     if hasattr(dataset, 'metadata_array'):
         metadata = dataset.metadata_array
@@ -310,19 +332,12 @@ def _stratified_partition_with_groups(dataset, num_bias_models, seed):
     group_labels = (metadata[:, 0].numpy()
                     if hasattr(metadata, 'numpy')
                     else np.array(metadata[:, 0]))
-    num_groups   = len(np.unique(group_labels))
+
+    num_groups  = len(np.unique(group_labels))
+    num_classes = num_groups // 2   # assumes 2 groups per class
     group_counts = np.array([(group_labels == g).sum() for g in range(num_groups)])
-
     print(f'  Group counts: {group_counts.tolist()}')
-
-    # Even group indices = spurious (majority), odd = conflicting (minority)
-    # Matches Waterbirds (0:landbird/land, 1:landbird/water, 2:waterbird/water, 3:waterbird/land)
-    # and CelebA (0:nonblond/female, 1:nonblond/male, 2:blond/female, 3:blond/male)
-    spurious_groups    = np.array([i for i in range(num_groups) if i % 2 == 0])
-    conflicting_groups = np.array([i for i in range(num_groups) if i % 2 == 1])
-
-    print(f'  Spurious groups:    {spurious_groups.tolist()}')
-    print(f'  Conflicting groups: {conflicting_groups.tolist()}')
+    print(f'  Num classes: {num_classes}  |  Groups per class: 2')
 
     # Shuffle indices within each group
     group_indices = {}
@@ -331,69 +346,77 @@ def _stratified_partition_with_groups(dataset, num_bias_models, seed):
         np.random.shuffle(idx)
         group_indices[g] = idx.tolist()
 
-    # Bias ratios: partition 0 most biased (0.95 spurious), last least biased (0.50)
-    bias_ratios = np.linspace(0.95, 0.50, num_bias_models)
+    # --- Per-class bias trajectories ---
+    # spread: maximum deviation from base_bias while keeping bias in [0.5, 1.0]
+    max_spread = min(base_bias - 0.5, 1.0 - base_bias)
+    offsets    = np.linspace(max_spread, -max_spread, N)  # +spread → -spread
 
-    # Bound partition size by minority pool so we don't exhaust conflicting samples
-    total_conflicting    = sum(len(group_indices[g]) for g in conflicting_groups)
-    samples_per_partition = (total_conflicting * 2) // num_bias_models
-    print(f'  Samples per partition (bounded): {samples_per_partition}')
+    # class c gets direction = +1 if even, -1 if odd → opposite trajectories
+    # average over partitions: base_bias + direction * mean(offsets) = base_bias + 0 ✓
+    class_biases = np.zeros((num_classes, N))
+    for c in range(num_classes):
+        direction       = 1 if c % 2 == 0 else -1
+        class_biases[c] = np.clip(base_bias + direction * offsets, 0.5, 1.0)
 
-    partitions = [[] for _ in range(num_bias_models)]
+    print(f'\n  Target bias per class per partition:')
+    for c in range(num_classes):
+        vals = '  '.join(f'{v:.2f}' for v in class_biases[c])
+        print(f'    Class {c}: [{vals}]  avg={class_biases[c].mean():.3f}')
 
-    # --- First pass: fill each partition to target bias ratio ---
-    for partition_idx in range(num_bias_models):
-        ratio      = bias_ratios[partition_idx]
-        n_spur     = int(samples_per_partition * ratio)
-        n_conf     = samples_per_partition - n_spur
-        n_spur_pg  = n_spur // len(spurious_groups)
-        n_conf_pg  = n_conf // len(conflicting_groups)
+    partitions = [[] for _ in range(N)]
 
-        for g in spurious_groups:
-            n_take = min(n_spur_pg, len(group_indices[g]))
-            partitions[partition_idx].extend(group_indices[g][:n_take])
-            group_indices[g] = group_indices[g][n_take:]
+    # --- Per class: allocate samples across partitions ---
+    for c in range(num_classes):
+        spur_g = 2 * c
+        conf_g = 2 * c + 1
 
-        for g in conflicting_groups:
-            n_take = min(n_conf_pg, len(group_indices[g]))
-            partitions[partition_idx].extend(group_indices[g][:n_take])
-            group_indices[g] = group_indices[g][n_take:]
+        spur_pool = list(group_indices[spur_g])
+        conf_pool = list(group_indices[conf_g])
 
-        np.random.shuffle(partitions[partition_idx])
-        print(f'  Partition {partition_idx}: {len(partitions[partition_idx])} samples, '
-              f'target bias: {ratio:.0%}')
+        n_total   = len(spur_pool) + len(conf_pool)
+        n_per_part = n_total // N   # base allocation per partition
 
-    # --- Second pass: distribute remaining samples proportionally ---
-    # Fixed: dedented out of the for loop — runs once after all partitions filled
-    remaining_spurious    = []
-    remaining_conflicting = []
-    for g in spurious_groups:
-        remaining_spurious.extend(group_indices[g])
-    for g in conflicting_groups:
-        remaining_conflicting.extend(group_indices[g])
+        # First pass: allocate n_per_part per partition at target bias
+        for i in range(N):
+            n_spur_i = min(int(round(class_biases[c][i] * n_per_part)), len(spur_pool))
+            n_conf_i = min(n_per_part - n_spur_i, len(conf_pool))
+            # if conf ran short, take more spurious instead
+            n_spur_i = min(n_spur_i + max(0, (n_per_part - n_spur_i) - n_conf_i),
+                           len(spur_pool))
 
-    np.random.shuffle(remaining_spurious)
-    np.random.shuffle(remaining_conflicting)
+            partitions[i].extend(spur_pool[:n_spur_i])
+            partitions[i].extend(conf_pool[:n_conf_i])
+            spur_pool = spur_pool[n_spur_i:]
+            conf_pool = conf_pool[n_conf_i:]
 
-    # High-bias partitions get more spurious; low-bias get more conflicting
-    spurious_weights    = bias_ratios / bias_ratios.sum()
-    conflicting_weights = (1 - bias_ratios) / (1 - bias_ratios).sum()
+        # Second pass: distribute remaining proportionally by target bias
+        if spur_pool or conf_pool:
+            spur_w = class_biases[c] / class_biases[c].sum()
+            conf_w = (1 - class_biases[c]) / (1 - class_biases[c]).sum()
 
-    spurious_splits    = np.round(spurious_weights * len(remaining_spurious)).astype(int)
-    conflicting_splits = np.round(conflicting_weights * len(remaining_conflicting)).astype(int)
+            spur_splits = np.round(spur_w * len(spur_pool)).astype(int)
+            conf_splits = np.round(conf_w * len(conf_pool)).astype(int)
+            spur_splits[-1] += len(spur_pool) - spur_splits.sum()
+            conf_splits[-1] += len(conf_pool) - conf_splits.sum()
 
-    # Absorb rounding error into last partition
-    spurious_splits[-1]    += len(remaining_spurious)    - spurious_splits.sum()
-    conflicting_splits[-1] += len(remaining_conflicting) - conflicting_splits.sum()
+            s, k = 0, 0
+            for i in range(N):
+                partitions[i].extend(spur_pool[s: s + spur_splits[i]])
+                partitions[i].extend(conf_pool[k: k + conf_splits[i]])
+                s += spur_splits[i]
+                k += conf_splits[i]
 
-    s_idx, c_idx = 0, 0
-    for partition_idx in range(num_bias_models):
-        s_take = spurious_splits[partition_idx]
-        c_take = conflicting_splits[partition_idx]
-        partitions[partition_idx].extend(remaining_spurious[s_idx:s_idx + s_take])
-        partitions[partition_idx].extend(remaining_conflicting[c_idx:c_idx + c_take])
-        s_idx += s_take
-        c_idx += c_take
-        np.random.shuffle(partitions[partition_idx])
+    # Shuffle each partition and report actual bias achieved
+    print(f'\n  Actual bias per class per partition:')
+    for i in range(N):
+        np.random.shuffle(partitions[i])
+        part_groups = group_labels[partitions[i]]
+        row = []
+        for c in range(num_classes):
+            n_s = (part_groups == 2 * c).sum()
+            n_c = (part_groups == 2 * c + 1).sum()
+            actual = n_s / (n_s + n_c) if (n_s + n_c) > 0 else 0
+            row.append(f'c{c}={actual:.2f}(t{class_biases[c][i]:.2f})')
+        print(f'    Partition {i} [{len(partitions[i])} samples]: {" | ".join(row)}')
 
     return partitions
