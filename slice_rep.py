@@ -27,10 +27,9 @@ from torch.utils.data import DataLoader, SequentialSampler, SubsetRandomSampler
 from datasets import train_val_split, get_resampled_indices, get_resampled_set
 
 # Logging and training
-from slice import compute_pseudolabels, train_spurious_model, compute_slice_indices
+from slice import train_spurious_model
 from utils.logging import log_data, initialize_csv_metrics
-from train import train_model, test_model, train, evaluate
-from utils import print_header, init_experiment
+from utils import print_header
 
 from utils.logging import summarize_acc, log_data
 from utils.visualize import plot_confusion, plot_data_batch

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from network import get_criterion, get_optim
-from network import save_checkpoint, get_output
+from network import save_checkpoint
 from utils import print_header
 from utils.logging import summarize_acc
 from utils.metrics import compute_roc_auc

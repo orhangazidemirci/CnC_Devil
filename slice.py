@@ -12,8 +12,7 @@ from torch.utils.data import DataLoader, SequentialSampler, SubsetRandomSampler
 from tqdm import tqdm
 
 from datasets import train_val_split, get_resampled_set, get_resampled_indices,initialize_data
-from train import train_model, test_model
-from network import get_criterion, get_optim, get_net, get_output
+from network import get_criterion, get_optim, get_net
 
 import random
 

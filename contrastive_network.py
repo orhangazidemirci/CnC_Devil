@@ -11,7 +11,7 @@ from transformers import BertForSequenceClassification, BertConfig
 from transformers import  get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from utils import free_gpu
-from network import CNN, MLP, get_output  
+from network import CNN, MLP  
 
 from resnet import *
 

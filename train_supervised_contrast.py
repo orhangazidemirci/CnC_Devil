@@ -406,7 +406,7 @@ def main():
     # -------------------------------------------------------------------------
     # Bias model (stage 1) training
     # -------------------------------------------------------------------------
-    parser.add_argument('--pretrained_spurious_path', default='', type=str,
+    parser.add_argument('--pretrained_spurious_path', default='yes', type=str,
                         help='Path to pretrained bias models (skips stage 1 if set)')
     parser.add_argument('--max_epoch_s', type=int, default=1,
                         help='Epochs to train each bias model')
