@@ -140,8 +140,7 @@ def initialize_data(args):
 
     # --- Dataset-specific args ---
     if 'waterbirds' in args.dataset:
-        args.root_dir        = getattr(args, 'root_dir', None) or \
-                               '../slice-and-dice-smol/datasets/data/Waterbirds/'
+        args.root_dir = 'C:/Users/Orhan/Documents/GitHub/CnC_Devil/datasets/data/Waterbirds/'
         args.target_name     = 'waterbird_complete95'
         args.confounder_names = ['forest2water2']
         args.image_mean      = np.mean([0.485, 0.456, 0.406])

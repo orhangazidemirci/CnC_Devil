@@ -10,7 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, SequentialSampler, SubsetRandomSampler
 from tqdm import tqdm
-
+import torch.nn as nn
+from train import train_model
 from datasets import train_val_split, get_resampled_set, get_resampled_indices,initialize_data
 from network import get_optim, get_net
 

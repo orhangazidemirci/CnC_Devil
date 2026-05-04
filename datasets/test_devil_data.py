@@ -31,7 +31,7 @@ def test_devil_mode():
     args.bs_val = 128
     args.num_workers = 0
     args.image_path = './images/waterbirds/'
-    args.root_dir = 'C:/Users/Orhan/Documents/GitHub/correct-n-contrast/datasets/data/Waterbirds/'
+    args.root_dir = 'C:/Users/Orhan/Documents/GitHub/CnC_Devil/datasets/data/Waterbirds/'
     args.val_split = 0.2
     args.log_path = './logs/'
     args.experiment_name = 'test'

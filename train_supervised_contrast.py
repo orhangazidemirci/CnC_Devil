@@ -406,7 +406,7 @@ def main():
     # -------------------------------------------------------------------------
     # Bias model (stage 1) training
     # -------------------------------------------------------------------------
-    parser.add_argument('--pretrained_spurious_path', default='yes', type=str,
+    parser.add_argument('--pretrained_spurious_path', default='', type=str,
                         help='Path to pretrained bias models (skips stage 1 if set)')
     parser.add_argument('--max_epoch_s', type=int, default=1,
                         help='Epochs to train each bias model')
@@ -424,11 +424,13 @@ def main():
                         help='Train with balanced ERM')
     parser.add_argument('--erm_only', default=False, action='store_true',
                         help='Train with standard ERM only (no debiasing)')
-
+    parser.add_argument('--pretrained', default=True, action='store_true')
     # -------------------------------------------------------------------------
     # Logging
     # -------------------------------------------------------------------------
     parser.add_argument('--log_loss_interval', type=int, default=10)
+    parser.add_argument('--log_interval', type=int, default=1)
+    parser.add_argument('--max_robust_acc', type=int, default=-1)
     parser.add_argument('--checkpoint_interval', type=int, default=50)
     parser.add_argument('--verbose', default=False, action='store_true')
 
