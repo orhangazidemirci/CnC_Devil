@@ -339,12 +339,6 @@ def _is_encoder(param_name, net):
     return top_level not in classifier_keywords
 
 
-def get_criterion(args, reduction='mean'):
-    if args.criterion == 'cross_entropy':
-        return nn.CrossEntropyLoss(reduction=reduction)
-    else:
-        raise NotImplementedError
-
 
 class BaseNet(nn.Module):
     def __init__(self, input_dim, hidden_dim_1=20):

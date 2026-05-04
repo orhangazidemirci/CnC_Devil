@@ -22,7 +22,7 @@ from datasets import train_val_split, get_resampled_indices, get_resampled_set, 
 from utils import print_header
 from utils.logging import Logger, log_args, summarize_acc, initialize_csv_metrics, log_data
 # Model
-from network import get_net, get_optim, get_criterion, load_pretrained_model
+from network import get_net, get_optim, load_pretrained_model
 
 # Contrastive
 from contrastive_network import DEFAULT_WEIGHTS, ContrastiveNet, load_encoder_state_dict
@@ -484,8 +484,10 @@ def main():
     log_args(args, logger)
     sys.stdout = logger
 
-    criterion = get_criterion(args, reduction='mean')
-    test_criterion = get_criterion(args, reduction='none')
+    criterion = nn.CrossEntropyLoss(reduction='mean')
+
+    test_criterion = nn.CrossEntropyLoss(reduction='mean')
+
 
     train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
         # train_loaders is a list of N loaders, one per bias model partition

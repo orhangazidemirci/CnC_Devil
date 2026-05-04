@@ -35,7 +35,7 @@ from utils.logging import summarize_acc, log_data
 from utils.visualize import plot_confusion, plot_data_batch
 
 # Model
-from network import get_net, get_optim, get_criterion, save_checkpoint
+from network import get_net, get_optim, save_checkpoint
 from activations import save_activations
 
 
