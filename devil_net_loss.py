@@ -26,73 +26,81 @@ from scipy.stats import mode
 # Step 1 — Precompute signals (run once before training)
 # ---------------------------------------------------------------------------
 
-def compute_devil_net_signals(bias_models, dataloader, data_idx, args, save_activations_fn):
+def get_targets_all(dataset):
+    """Unwrap Subset to get targets_all"""
+    if hasattr(dataset, 'dataset'):  # Subset
+        return dataset.dataset.targets_all
+    return dataset.targets_all
+
+
+def compute_devil_net_signals(bias_models, dataloader, data_idx, args):
     """
-    For a single partition (data_idx), collect per-sample Angel and Devil
-    predictions and embeddings.
-
-    Args:
-        bias_models       : list of N trained bias models (one per shard)
-        dataloader        : dataloader for shard data_idx
-        data_idx          : index of the current shard (this shard's model = Devil)
-        args              : args namespace (needs args.device)
-        save_activations_fn: function(model, dataloader, args) -> (embeddings, predictions)
-                             embeddings: np.ndarray (N, D)
-                             predictions: np.ndarray (N,)  class indices
-
-    Returns dict with keys:
-        angel_predictions : np.ndarray (N,)   majority-vote across all unseen models
-        devil_predictions : np.ndarray (N,)   own (seen) model predictions
-        angel_embeddings  : np.ndarray (N, D) mean embedding across all unseen models
-        devil_embeddings  : np.ndarray (N, D) own model embeddings
-        targets           : np.ndarray (N,)   true labels
+    Returns per-sample Angel/Devil predictions and embeddings
+    for use in the Devil-NET contrastive loss.
     """
-    # Collect targets
-    dataset = dataloader.dataset
-    if hasattr(dataset, 'targets_all'):
-        targets = np.array(dataset.targets_all['target'])
-    else:
-        targets = np.array([dataset[i][1] for i in range(len(dataset))])
-
-    if hasattr(dataset, 'indices'):
-        targets = targets[dataset.indices]
-
+    targets = get_targets_all(dataloader.dataset)['target']
     n_samples = len(targets)
 
-    # --- Devil: own model (has seen this shard) ---
-    devil_embeddings, devil_predictions = save_activations_fn(
+    # --- Devil: own model (seen this shard) ---
+    devil_embeddings, devil_predictions = save_activations(
         bias_models[data_idx], dataloader, args)
-    # devil_embeddings: (N, D), devil_predictions: (N,)
 
-    # --- Angel: all unseen models ---
-    angel_emb_list  = []
-    angel_pred_list = []
+    # --- Angel: aggregate over all unseen models ---
+    angel_embeddings_all = []
+    angel_predictions_all = []
 
     for model_idx, model in enumerate(bias_models):
         if model_idx == data_idx:
             continue                          # skip Devil
-        emb, pred = save_activations_fn(model, dataloader, args)
-        angel_emb_list.append(emb)            # (N, D)
-        angel_pred_list.append(pred)          # (N,)
+        emb, pred = save_activations(model, dataloader, args)
+        angel_embeddings_all.append(emb)
+        angel_predictions_all.append(pred)
 
-    if len(angel_emb_list) == 0:
-        raise ValueError(f"No Angel models found for shard {data_idx}. "
-                         f"Need at least 2 shards total.")
+    # majority vote for Angel prediction
+    angel_predictions_stack = np.stack(angel_predictions_all, axis=1)  # (N, n_angels)
 
-    # Majority-vote Angel prediction across all unseen models
-    angel_pred_stack   = np.stack(angel_pred_list, axis=1)       # (N, n_angels)
-    angel_predictions  = mode(angel_pred_stack, axis=1).mode.squeeze()  # (N,)
+# --- Best Angel: per sample, pick the Angel with highest confidence on correct class ---
+    # Requires save_activations to also return logits — if not available, falls back to first-correct
 
-    # Mean Angel embedding
-    angel_embeddings   = np.mean(np.stack(angel_emb_list, axis=0), axis=0)  # (N, D)
+    n_samples = len(targets)
+    emb_dim   = angel_embeddings_all[0].shape[1]
 
+    angel_embeddings  = np.zeros((n_samples, emb_dim), dtype=np.float32)
+    angel_predictions = np.zeros(n_samples, dtype=np.int64)
+
+    for sample_idx in range(n_samples):
+        best_emb   = None
+        best_pred  = None
+        best_conf  = -1.0
+
+        for emb, pred in zip(angel_embeddings_all, angel_predictions_all):
+            if pred[sample_idx] == targets[sample_idx]:
+                # Use L2 norm of embedding as a proxy for confidence
+                # (higher norm = more activated = more certain)
+                conf = np.linalg.norm(emb[sample_idx])
+                if conf > best_conf:
+                    best_conf = conf
+                    best_emb  = emb[sample_idx]
+                    best_pred = pred[sample_idx]
+
+        if best_emb is not None:
+            angel_embeddings[sample_idx]  = best_emb
+            angel_predictions[sample_idx] = best_pred
+        else:
+            # No Angel got this sample right — fall back to mean embedding
+            angel_embeddings[sample_idx]  = np.mean(
+                [e[sample_idx] for e in angel_embeddings_all], axis=0)
+            angel_predictions[sample_idx] = angel_predictions_all[0][sample_idx]
+            
     return {
-        'angel_predictions': angel_predictions.astype(np.int64),
-        'devil_predictions': devil_predictions.astype(np.int64),
-        'angel_embeddings':  angel_embeddings.astype(np.float32),
-        'devil_embeddings':  devil_embeddings.astype(np.float32),
-        'targets':           targets.astype(np.int64),
+        'angel_predictions': angel_predictions,   # â per sample
+        'devil_predictions': devil_predictions,   # d̂ per sample
+        'angel_embeddings':  angel_embeddings,    # z_angel per sample
+        'devil_embeddings':  devil_embeddings,    # z_devil per sample
+        'targets':           targets,
     }
+
+
 
 
 # ---------------------------------------------------------------------------
