@@ -202,7 +202,7 @@ def compute_slice_outputs(erm_models, train_loaders, args):
     loss_fn = DevilNetLoss(sliced_outputs, weights=DEFAULT_WEIGHTS, temperature=args.temperature)
 
 
-    return sliced_outputs, train_loaders, loss_fn
+    return sliced_outputs, train_loader, loss_fn
 
 
 
@@ -623,16 +623,15 @@ def main():
     
         slice_outputs = compute_slice_outputs(erm_models,  train_loaders, args)
         # log signal quality before training starts
-        log_devil_signals(sliced_outputs)
         sliced_outputs, train_loaders, loss_fn = slice_outputs
+        log_devil_signals(sliced_outputs)
 
         for i in range(args.num_bias_models):
             print(f'Partition {i}:')
-            for _, p in erm_models[i].named_parameters():
-                p = p.to(torch.device('cpu'))
-                erm_models[i].to(torch.device('cpu'))
+            erm_models[i].to(torch.device('cpu'))      
 
-
+        torch.cuda.empty_cache()
+        
         # -------------
         # Train encoder
         # -------------
@@ -640,7 +639,7 @@ def main():
         
         optimizer= get_optim(net, args, model_type='main')
         best_state, history = train_devil_net(
-            model=model,
+            model=net,
             erm_models=erm_models,
             train_loaders=slice_outputs,
             val_loader=val_loader,
