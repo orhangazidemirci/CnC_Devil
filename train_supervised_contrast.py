@@ -20,7 +20,8 @@ from datasets import train_val_split, get_resampled_indices, get_resampled_set, 
 # Logging and training
 # , update_contrastive_experiment_name
 from utils import print_header
-from utils.logging import Logger, log_args, summarize_acc, initialize_csv_metrics, log_data
+from utils.logging import (Logger, log_args, summarize_acc, initialize_csv_metrics,
+                            log_data, log_devil_signals, log_partition_bias, log_epoch)
 # Model
 from network import get_net, get_optim, load_pretrained_model
 
@@ -286,15 +287,8 @@ def train_devil_net(model, erm_models, train_loaders, val_loader, test_loader,
         epoch_log = {'epoch': epoch, **train_losses, **{f'val_{k}': v
                      for k, v in val_results.items()}}
         history.append(epoch_log)
-
-        print(f'Epoch {epoch:3d} | '
-              f'loss={train_losses["total"]:.4f} '
-              f'ce={train_losses["ce"]:.4f} '
-              f'self={train_losses["self"]:.4f} '
-              f'batch={train_losses["batch"]:.4f} | '
-              f'val_avg={val_results["avg_acc"]*100:.1f}%' +
-              (f' val_worst={val_results["worst_group"]*100:.1f}%'
-               if 'worst_group' in val_results else ''))
+        
+        log_epoch(epoch, train_losses, val_results)
 
         # Save best model by val average accuracy
         # (swap to worst_group if group_labels_val is provided)
@@ -493,7 +487,9 @@ def main():
 
     train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
         # train_loaders is a list of N loaders, one per bias model partition
-        
+
+    log_partition_bias(train_loaders)
+
     # Extract group labels for worst-group evaluation
     # These come from the dataset's metadata_array — column 0 is the group id
     # Works for Waterbirds, CelebA, CivilComments, CXR (all bias benchmarks)
@@ -626,6 +622,8 @@ def main():
     if args.train_encoder is True:
     
         slice_outputs = compute_slice_outputs(erm_models,  train_loaders, args)
+        # log signal quality before training starts
+        log_devil_signals(sliced_outputs)
         sliced_outputs, train_loaders, loss_fn = slice_outputs
 
         for i in range(args.num_bias_models):
