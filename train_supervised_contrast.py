@@ -611,7 +611,7 @@ def main():
                                                         args)
             partition_erm_models.eval()
             erm_models.append(partition_erm_models)  
-
+        print(f'Pretrained model loaded from {args.bias_model_path}')
         args.mode = 'train_spurious'
     else:
         args.mode = 'train_spurious'
@@ -621,7 +621,7 @@ def main():
     
     for i in range(args.num_bias_models):
         erm_models[i].eval()
-    print(f'Pretrained model loaded from {fpath}')
+    
 
     if args.train_encoder is True:
     
