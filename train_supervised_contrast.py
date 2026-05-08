@@ -20,9 +20,10 @@ from datasets import train_val_split, get_resampled_indices, get_resampled_set, 
 # Logging and training
 # , update_contrastive_experiment_name
 from utils import print_header
-from utils.logging import Logger, log_args, summarize_acc, initialize_csv_metrics, log_data
+from utils.logging import (Logger, log_args, summarize_acc, initialize_csv_metrics,
+                            log_data, log_devil_signals, log_partition_bias, log_epoch)
 # Model
-from network import get_net, get_optim, get_criterion, load_pretrained_model
+from network import get_net, get_optim, load_pretrained_model
 
 # Contrastive
 from contrastive_network import DEFAULT_WEIGHTS, ContrastiveNet, load_encoder_state_dict
@@ -45,18 +46,72 @@ class IndexedDataset(Dataset):
 
     def __getitem__(self, idx):
         data = self.dataset[idx]
-        return (*data, idx)   # append global index to whatever the dataset returns
+        if len(data) == 2:
+            return (*data, idx)   # (inputs, labels) → add idx
+        return data               # already has idx — don't append again
+
+
+class OffsetDataset(Dataset):
+    """Wraps a dataset and shifts its returned index by a global offset."""
+    def __init__(self, dataset, offset):
+        self.dataset = dataset
+        self.offset  = offset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        if len(data) == 2:
+            return (*data, idx + self.offset)
+        # use idx (local sequential position 0..len-1), not data[-1] (original row number)
+        return (*data[:-1], idx + self.offset)
+    
+class OffsetDataset(Dataset):
+    def __init__(self, dataset, offset):
+        self.dataset = dataset
+        self.offset  = offset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        # Replace whatever index the dataset returns with our sequential global index
+        # idx is the local position within this subset (0..len-1)
+        # offset shifts it to the global position in sliced_outputs
+        return (*data[:-1], idx + self.offset)
+
+class DevilNetModel(nn.Module):
+    """
+    Wraps any get_net() model to return (embeddings, logits).
+    Hooks activation_layer to extract mid-layer features.
+    """
+    def __init__(self, net):
+        super().__init__()
+        self.net        = net
+        self._embedding = None
+
+        # Hook the activation layer
+        target = dict(net.named_modules()).get(net.activation_layer)
+        if target is None:
+            raise ValueError(f"activation_layer '{net.activation_layer}' not found.")
+        target.register_forward_hook(self._hook)
+
+    def _hook(self, module, input, output):
+        # avgpool output is (B, D, 1, 1) — flatten to (B, D)
+        self._embedding = output.flatten(start_dim=1)
+
+    def forward(self, x):
+        logits = self.net(x)
+        return self._embedding, logits
+   
+
 
 def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
-    """
-    One full training epoch.
-
-    Returns dict of mean losses for the epoch.
-    """
     model.train()
     losses = {'total': [], 'ce': [], 'self': [], 'batch': []}
-
-    pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
+    pbar   = tqdm(train_loader, desc=f'Epoch {epoch}')
 
     for batch in pbar:
         inputs, labels, indices = batch
@@ -66,13 +121,8 @@ def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
 
         optimizer.zero_grad()
 
-        # Forward — model must return (embeddings, logits)
         embeddings, logits = model(inputs)
-
-        # CE on classifier head
-        ce_loss = F.cross_entropy(logits, labels)
-
-        # Self + batch contrastive losses
+        ce_loss            = F.cross_entropy(logits, labels)
         contrastive_loss, self_loss, batch_loss = loss_fn(indices, embeddings)
 
         total_loss = ce_loss + contrastive_loss
@@ -87,16 +137,71 @@ def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
         losses['ce'].append(ce_loss.item())
         losses['self'].append(self_loss.item())
         losses['batch'].append(batch_loss.item())
-
         pbar.set_postfix({k: f'{np.mean(v):.4f}' for k, v in losses.items()})
 
     return {k: np.mean(v) for k, v in losses.items()}
 
 
+def train_devil_net(model, erm_models, train_loader, loss_fn,
+                    val_loader, test_loader,
+                    optimizer, scheduler, args,
+                    group_labels_val=None, group_labels_test=None):
+
+    if args.train_encoder is not True:
+        return None, []
+
+    for i in range(len(erm_models)):
+        erm_models[i].to(torch.device('cpu'))
+    torch.cuda.empty_cache()
+
+    print_header('Devil-NET: Training')
+    history, best_val_acc, best_model_state = [], -1.0, None
+
+    for epoch in range(1, args.max_epoch + 1):
+        train_losses = train_epoch(model, train_loader, loss_fn,
+                                   optimizer, args, epoch)
+        val_results  = evaluate(model, val_loader, args,
+                                group_labels=group_labels_val)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        history.append({'epoch': epoch, **train_losses,
+                        **{f'val_{k}': v for k, v in val_results.items()}})
+        log_epoch(epoch, train_losses, val_results)
+
+        monitor = val_results.get('worst_group', val_results['avg_acc'])
+        if monitor > best_val_acc:
+            best_val_acc     = monitor
+            best_model_state = {k: v.cpu().clone()
+                                for k, v in model.state_dict().items()}
+
+    print_header('Devil-NET: Test evaluation')
+    model.load_state_dict({k: v.to(args.device)
+                           for k, v in best_model_state.items()})
+    test_results = evaluate(model, test_loader, args,
+                            group_labels=group_labels_test)
+
+    print(f'Test avg accuracy:   {test_results["avg_acc"]*100:.2f}%')
+    if 'worst_group' in test_results:
+        print(f'Test worst-group:    {test_results["worst_group"]*100:.2f}%')
+        for g, acc in test_results['group_accs'].items():
+            print(f'  Group {g}: {acc*100:.2f}%')
+
+    return best_model_state, history
+
 # ---------------------------------------------------------------------------
 # Step 3 — evaluate
 # Returns average accuracy and worst-group accuracy
 # ---------------------------------------------------------------------------
+
+def get_group_labels(loader):
+    dataset = loader.dataset
+    if hasattr(dataset, 'dataset'):
+        dataset = dataset.dataset
+    if hasattr(dataset, 'metadata_array'):
+        return dataset.metadata_array[:, 0].numpy().astype(np.int64)
+    return None
 
 def evaluate(model, dataloader, args, group_labels=None):
     """
@@ -145,12 +250,13 @@ def evaluate(model, dataloader, args, group_labels=None):
 
     # Worst-group accuracy
     if group_labels is not None:
-        all_idx = np.concatenate(all_idx) if all_idx else np.arange(len(all_labels))
+        # group_labels already in dataloader order — no indexing needed
+        sample_groups = group_labels[:len(all_preds)]
         group_accs = {}
-        for g in np.unique(group_labels):
-            g_mask         = group_labels[all_idx] == g
-            group_accs[g]  = (all_preds[g_mask] == all_labels[g_mask]).mean() \
-                             if g_mask.sum() > 0 else 0.0
+        for g in np.unique(sample_groups):
+            g_mask        = sample_groups == g
+            group_accs[g] = (all_preds[g_mask] == all_labels[g_mask]).mean() \
+                            if g_mask.sum() > 0 else 0.0
         results['worst_group'] = min(group_accs.values())
         results['group_accs']  = group_accs
 
@@ -158,9 +264,8 @@ def evaluate(model, dataloader, args, group_labels=None):
 
 def compute_slice_outputs(erm_models, train_loaders, args):
     """
-    Compute predictions of ERM model to set up contrastive batches
+    Compute Angel/Devil signals for all partitions and build combined DataLoader.
     """
-
     sliced_outputs = {
         'angel_predictions': [],
         'devil_predictions': [],
@@ -171,160 +276,47 @@ def compute_slice_outputs(erm_models, train_loaders, args):
 
     for data_idx, train_loader in enumerate(train_loaders):
         print_header(f'Partition {data_idx}:')
-
-        # ✓ pass ALL models, not just data_idx
         slice_output = compute_devil_net_signals(
             bias_models=erm_models,
             dataloader=train_loader,
             data_idx=data_idx,
-            args=args
-,                )
-
+            args=args,
+        )
         for k in sliced_outputs:
             sliced_outputs[k].append(slice_output[k])
 
-    # concatenate across all partitions
+    # concatenate across all partitions → global index space
     sliced_outputs = {k: np.concatenate(v, axis=0) for k, v in sliced_outputs.items()}
 
-    # ✓ wrap with index tracking
-    combined_dataset = IndexedDataset(
-        ConcatDataset([loader.dataset for loader in train_loaders])
-    )
+    # Build combined DataLoader with global index offsets
+    # Each partition's dataset returns local indices — OffsetDataset shifts them
+    # so they align with the concatenated sliced_outputs array
+    offset          = 0
+    offset_datasets = []
+    for loader in train_loaders:
+        offset_datasets.append(OffsetDataset(loader.dataset, offset))
+        offset += len(loader.dataset)
+
+    combined_dataset = ConcatDataset(offset_datasets)
     train_loader = DataLoader(
         combined_dataset,
         batch_size=args.bs_trn,
         shuffle=False,          # must stay False — indices must match sliced_outputs
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
     )
 
-    # build loss function
-    loss_fn = DevilNetLoss(sliced_outputs, weights=DEFAULT_WEIGHTS, temperature=args.temperature)
-
-
-    return sliced_outputs, train_loaders, loss_fn
-
-
-
-def train_devil_net(model, erm_models, train_loaders, val_loader, test_loader,
-                    optimizer, scheduler, args,
-                    group_labels_val=None, group_labels_test=None):
-    """
-    Full Devil-NET training loop.
-
-    Args:
-        model             : the main model being trained (encoder + classifier)
-        erm_models        : list of N pretrained ERM/bias models
-        train_loaders     : list of N DataLoaders, one per partition
-        val_loader        : validation DataLoader
-        test_loader       : test DataLoader
-        optimizer         : torch optimizer
-        scheduler         : lr scheduler (or None)
-        args              : args namespace — needs:
-                              args.max_epoch, args.bs_trn, args.num_workers,
-                              args.temperature, args.alpha, args.beta,
-                              args.device, args.clip_grad_norm (optional),
-                              args.hard_neg_factor (optional)
-        save_activations_fn: function(model, loader, args) -> (emb, pred)
-        group_labels_val  : optional np.ndarray for worst-group val eval
-        group_labels_test : optional np.ndarray for worst-group test eval
-
-    Returns:
-        best_model_state : state_dict of model with best val accuracy
-        history          : list of per-epoch dicts with losses + metrics
-    """
-
-    sliced_outputs, train_loader, loss_fn= train_loaders
-
-    if args.train_encoder is not True:
-        return None, []
-
-    # ------------------------------------------------------------------
-    # Compute Angel/Devil signals once before training
-    # ------------------------------------------------------------------
-    print_header('Devil-NET: Computing Angel/Devil signals')
-
-
-
-    # Free ERM models from memory — no longer needed
-    for i in range(len(erm_models)):
-        erm_models[i].to(torch.device('cpu'))
-    torch.cuda.empty_cache()
-
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-    print_header('Devil-NET: Training')
-
-    history          = []
-    best_val_acc     = -1.0
-    best_model_state = None
-
-    for epoch in range(1, args.max_epoch + 1):
-
-        # Train
-        train_losses = train_epoch(
-            model=model,
-            train_loader=train_loader,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            args=args,
-            epoch=epoch,
-        )
-
-        # Validate
-        val_results = evaluate(
-            model=model,
-            dataloader=val_loader,
-            args=args,
-            group_labels=group_labels_val,
-        )
-
-        if scheduler is not None:
-            scheduler.step()
-
-        # Log
-        epoch_log = {'epoch': epoch, **train_losses, **{f'val_{k}': v
-                     for k, v in val_results.items()}}
-        history.append(epoch_log)
-
-        print(f'Epoch {epoch:3d} | '
-              f'loss={train_losses["total"]:.4f} '
-              f'ce={train_losses["ce"]:.4f} '
-              f'self={train_losses["self"]:.4f} '
-              f'batch={train_losses["batch"]:.4f} | '
-              f'val_avg={val_results["avg_acc"]*100:.1f}%' +
-              (f' val_worst={val_results["worst_group"]*100:.1f}%'
-               if 'worst_group' in val_results else ''))
-
-        # Save best model by val average accuracy
-        # (swap to worst_group if group_labels_val is provided)
-        monitor = val_results.get('worst_group', val_results['avg_acc'])
-        if monitor > best_val_acc:
-            best_val_acc     = monitor
-            best_model_state = {k: v.cpu().clone()
-                                for k, v in model.state_dict().items()}
-
-    # ------------------------------------------------------------------
-    # Final test evaluation on best model
-    # ------------------------------------------------------------------
-    print_header('Devil-NET: Test evaluation')
-    model.load_state_dict({k: v.to(args.device)
-                           for k, v in best_model_state.items()})
-
-    test_results = evaluate(
-        model=model,
-        dataloader=test_loader,
-        args=args,
-        group_labels=group_labels_test,
+    loss_fn = DevilNetLoss(
+        sliced_outputs,
+        weights=DEFAULT_WEIGHTS,
+        temperature=args.temperature,
+        alpha=args.alpha,
+        beta=args.beta,
+        hard_neg_factor=getattr(args, 'hard_neg_factor', 0.0),
     )
 
-    print(f'Test avg accuracy:   {test_results["avg_acc"]*100:.2f}%')
-    if 'worst_group' in test_results:
-        print(f'Test worst-group:    {test_results["worst_group"]*100:.2f}%')
-        for g, acc in test_results['group_accs'].items():
-            print(f'  Group {g}: {acc*100:.2f}%')
+    return sliced_outputs, train_loader, loss_fn
 
-    return best_model_state, history
+
 
 def main():
     parser = argparse.ArgumentParser(description='Compare & Contrast')
@@ -406,7 +398,7 @@ def main():
     # -------------------------------------------------------------------------
     # Bias model (stage 1) training
     # -------------------------------------------------------------------------
-    parser.add_argument('--pretrained_spurious_path', default='', type=str,
+    parser.add_argument('--pretrained_spurious_path', default='true', type=str,
                         help='Path to pretrained bias models (skips stage 1 if set)')
     parser.add_argument('--max_epoch_s', type=int, default=1,
                         help='Epochs to train each bias model')
@@ -424,11 +416,13 @@ def main():
                         help='Train with balanced ERM')
     parser.add_argument('--erm_only', default=False, action='store_true',
                         help='Train with standard ERM only (no debiasing)')
-
+    parser.add_argument('--pretrained', default=True, action='store_true')
     # -------------------------------------------------------------------------
     # Logging
     # -------------------------------------------------------------------------
     parser.add_argument('--log_loss_interval', type=int, default=10)
+    parser.add_argument('--log_interval', type=int, default=1)
+    parser.add_argument('--max_robust_acc', type=int, default=-1)
     parser.add_argument('--checkpoint_interval', type=int, default=50)
     parser.add_argument('--verbose', default=False, action='store_true')
 
@@ -484,12 +478,16 @@ def main():
     log_args(args, logger)
     sys.stdout = logger
 
-    criterion = get_criterion(args, reduction='mean')
-    test_criterion = get_criterion(args, reduction='none')
+    criterion = nn.CrossEntropyLoss(reduction='mean')
+
+    test_criterion = nn.CrossEntropyLoss(reduction='mean')
+
 
     train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
         # train_loaders is a list of N loaders, one per bias model partition
-        
+
+    log_partition_bias(train_loaders)
+
     # Extract group labels for worst-group evaluation
     # These come from the dataset's metadata_array — column 0 is the group id
     # Works for Waterbirds, CelebA, CivilComments, CXR (all bias benchmarks)
@@ -607,7 +605,7 @@ def main():
                                                         args)
             partition_erm_models.eval()
             erm_models.append(partition_erm_models)  
-
+        print(f'Pretrained model loaded from {args.bias_model_path}')
         args.mode = 'train_spurious'
     else:
         args.mode = 'train_spurious'
@@ -617,38 +615,45 @@ def main():
     
     for i in range(args.num_bias_models):
         erm_models[i].eval()
-    print(f'Pretrained model loaded from {fpath}')
+    
 
     if args.train_encoder is True:
-    
-        slice_outputs = compute_slice_outputs(erm_models,  train_loaders, args)
-        sliced_outputs, train_loaders, loss_fn = slice_outputs
+
+        sliced_outputs, train_loader, loss_fn = compute_slice_outputs(
+            erm_models, train_loaders, args)
+
+        log_devil_signals(sliced_outputs)
+
+        # debug index alignment
+        batch = next(iter(train_loader))
+        _, _, idx = batch
+        print(f'Batch indices range: {idx.min().item()} - {idx.max().item()}')
+        print(f'sliced_outputs size: {loss_fn.targets.shape[0]}')
 
         for i in range(args.num_bias_models):
-            print(f'Partition {i}:')
-            for _, p in erm_models[i].named_parameters():
-                p = p.to(torch.device('cpu'))
-                erm_models[i].to(torch.device('cpu'))
+            erm_models[i].to(torch.device('cpu'))
+        torch.cuda.empty_cache()
 
-
-        # -------------
-        # Train encoder
-        # -------------
         net = get_net(args)
-        
-        optimizer= get_optim(net, args, model_type='main')
+        net = DevilNetModel(net)
+        net.to(args.device)
+
+        optimizer = get_optim(net, args, model_type='main')
+
         best_state, history = train_devil_net(
-            model=model,
+            model=net,
             erm_models=erm_models,
-            train_loaders=slice_outputs,
+            train_loader=train_loader,      # ← single combined loader, not slice_outputs
+            loss_fn=loss_fn,                # ← pass directly, not inside train_loaders
             val_loader=val_loader,
             test_loader=test_loader,
             optimizer=optimizer,
-            scheduler=scheduler,
+            scheduler=None,
             args=args,
             group_labels_val=group_labels_val,
-            group_labels_test=group_labels_test
+            group_labels_test=group_labels_test,
         )
  
 if __name__ == '__main__':
     main()
+ 

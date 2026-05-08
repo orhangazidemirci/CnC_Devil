@@ -10,10 +10,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, SequentialSampler, SubsetRandomSampler
 from tqdm import tqdm
-
+import torch.nn as nn
+from train import train_model
 from datasets import train_val_split, get_resampled_set, get_resampled_indices,initialize_data
-from train import train_model, test_model
-from network import get_criterion, get_optim, get_net, get_output
+from network import get_optim, get_net
 
 import random
 
@@ -33,7 +33,7 @@ def train_spurious_model(train_loaders, args, resample=False,
   
     net = get_net(args)
     optim = get_optim(net, args, model_type='spurious')
-    criterion = get_criterion(args)
+    criterion = nn.CrossEntropyLoss(reduction='mean')
     
     log_test_results = True if test_loader is not None else False
     
@@ -67,7 +67,8 @@ def train_spurious_model(train_loaders, args, resample=False,
         # optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9, weight_decay=5e-4)
         # optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE) # Using Adam 
         optim = get_optim(model, args, model_type='spurious')
-        criterion = get_criterion(args)
+        criterion = nn.CrossEntropyLoss(reduction='mean')
+
         
         log_test_results = True if test_loader is not None else False
         

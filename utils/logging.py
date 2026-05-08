@@ -6,6 +6,56 @@ import sys
 import csv
 import numpy as np
 
+def log_epoch(epoch, train_losses, val_results):
+    line = (f'Epoch {epoch:3d} | '
+            f'loss={train_losses["total"]:.4f}  '
+            f'ce={train_losses["ce"]:.4f}  '
+            f'self={train_losses["self"]:.4f}  '
+            f'batch={train_losses["batch"]:.4f} | '
+            f'val_avg={val_results["avg_acc"]*100:.1f}%')
+    if 'worst_group' in val_results:
+        line += f'  val_worst={val_results["worst_group"]*100:.1f}%'
+    print(line)
+
+
+def log_devil_signals(sliced_outputs):
+    targets = sliced_outputs['targets']
+    a_pred  = sliced_outputs['angel_predictions']
+    d_pred  = sliced_outputs['devil_predictions']
+    N       = len(targets)
+
+    angel_correct = (a_pred == targets).mean() * 100
+    devil_correct = (d_pred == targets).mean() * 100
+    tf_case = ((a_pred == targets) & (d_pred != targets)).mean() * 100
+    tt_case = ((a_pred == targets) & (d_pred == targets)).mean() * 100
+    ff_case = ((a_pred != targets) & (d_pred != targets)).mean() * 100
+    ft_case = ((a_pred != targets) & (d_pred == targets)).mean() * 100
+
+    print(f'\n--- Devil-NET Signal Quality (N={N}) ---')
+    print(f'  Angel correct:               {angel_correct:.1f}%')
+    print(f'  Devil correct:               {devil_correct:.1f}%')
+    print(f'  TF — strongest signal:       {tf_case:.1f}%')
+    print(f'  TT — angel pos only:         {tt_case:.1f}%')
+    print(f'  FF — devil neg only:         {ff_case:.1f}%')
+    print(f'  FT — conservative neg:       {ft_case:.1f}%')
+    print('-' * 42)
+
+
+def log_partition_bias(train_loaders, group_col=0):
+    print('\n--- Partition Bias Summary ---')
+    for i, loader in enumerate(train_loaders):
+        dataset = loader.dataset
+        if hasattr(dataset, 'indices') and hasattr(dataset.dataset, 'metadata_array'):
+            meta   = dataset.dataset.metadata_array[dataset.indices, group_col]
+            groups = meta.numpy() if hasattr(meta, 'numpy') else np.array(meta)
+            n_spur = (groups % 2 == 0).sum()
+            ratio  = n_spur / len(groups)
+            print(f'  Partition {i}: {len(groups):5d} samples  '
+                  f'spurious ratio={ratio:.3f}')
+        else:
+            print(f'  Partition {i}: {len(loader.dataset):5d} samples  '
+                  f'(no metadata available)')
+    print('-' * 40)
 
 def summarize_acc(correct_by_groups, total_by_groups, stdout=True):
     all_correct = 0
@@ -37,11 +87,22 @@ def summarize_acc(correct_by_groups, total_by_groups, stdout=True):
 
 
 def initialize_csv_metrics(args):
-    test_metrics = {'epoch': [], 'target': [], 'spurious': [],
-                    'acc': [], 'loss': [], 'model_type': [], 
-                    'robust_acc': [], 'max_robust_acc': []}
-    args.test_metrics = test_metrics
-    args.max_robust_acc = 0
+    test_metrics = {
+        'epoch':          [],
+        'target':         [],
+        'spurious':       [],
+        'acc':            [],
+        'loss':           [],
+        'loss_ce':        [],   # new
+        'loss_self':      [],   # new
+        'loss_batch':     [],   # new
+        'model_type':     [],
+        'robust_acc':     [],
+        'max_robust_acc': [],
+    }
+    args.test_metrics    = test_metrics
+    args.max_robust_acc  = 0
+    args.max_robust_epoch = 0   # new — track which epoch was best
 
 
 class Logger(object):
@@ -94,7 +155,7 @@ class Logger(object):
             os.fsync(self.file.fileno())
 
     def close(self):
-        self.console.close()
+        # Never close sys.stdout
         if self.file is not None:
             self.file.close()
 

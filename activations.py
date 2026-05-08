@@ -7,7 +7,6 @@ from tqdm import tqdm
 
 from utils import print_header
 from utils.visualize import plot_umap
-from network import get_output
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -50,7 +49,7 @@ def save_activations(model, dataloader, args):
     with torch.no_grad():
         for inputs, labels, _ in tqdm(dataloader, desc='Saving activations'):
             inputs  = inputs.to(args.device)
-            outputs = get_output(model, inputs, labels, args)
+            outputs = model(inputs)
             _, pred = torch.max(outputs, 1)
             predictions.append(pred.cpu())
 
