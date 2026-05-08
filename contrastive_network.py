@@ -112,12 +112,9 @@ class ContrastiveNet(nn.Module):
                     print(f'- {e}')
                 
         except KeyError:
-            raise InvalidBackboneError(
+            raise ValueError(
                 "Invalid backbone architecture. Check the config file and pass one of: resnet18 or resnet50")
-        else:
-            return model
-        
-        
+                
     def init_projection_head(self, backbone, out_dim, project=True):
         if 'resnet' in self.base_model or 'cnn' in self.base_model or 'mlp' in self.base_model:
             dim_mlp = backbone.fc.in_features
