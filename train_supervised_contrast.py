@@ -361,7 +361,7 @@ def main():
     # -------------------------------------------------------------------------
     parser.add_argument('--temperature', type=float, default=0.05,
                         help='Contrastive temperature τ')
-    parser.add_argument('--alpha', type=float, default=1.0,
+    parser.add_argument('--alpha', type=float, default=0.1,
                         help='Weight for self loss (Table 1) in L_total')
     parser.add_argument('--beta', type=float, default=1.0,
                         help='Weight for batch contrastive loss (Table 2) in L_total')
@@ -381,7 +381,7 @@ def main():
     # -------------------------------------------------------------------------
     # Optimizer
     # -------------------------------------------------------------------------
-    parser.add_argument('--optim', type=str, default='sgd',
+    parser.add_argument('--optim', type=str, default='adam',
                         choices=['AdamW', 'adam', 'sgd'])
     parser.add_argument('--max_epoch', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-4)

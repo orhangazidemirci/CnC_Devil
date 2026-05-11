@@ -128,7 +128,7 @@ python train_supervised_contrast.py \
     --max_epoch 10 \
     --lr 1e-4 \
     --temperature 0.07 \
-    --alpha 1.0 \
+    --alpha 0.1 \
     --beta 1.0 \
     --hard_neg_factor 0.0 \
     --bs_trn 128 \

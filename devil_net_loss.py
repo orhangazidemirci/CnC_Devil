@@ -216,7 +216,7 @@ class DevilNetLoss(nn.Module):
 
         # minimize: -sim for angel_pos, +sim for devil_neg
         loss = torch.zeros(len(idx), device=z.device)
-        loss[TT] = -w['w1'] * angel_sim[TT]
+        loss[TT] = 0 #-w['w1'] * angel_sim[TT]
         loss[TF] = -w['w2'] * angel_sim[TF] + w['w3'] * devil_sim[TF]
         loss[FF] =  w['w4'] * devil_sim[FF]
         loss[FT] =  w['w5'] * devil_sim[FT]
