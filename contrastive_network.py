@@ -237,7 +237,7 @@ class DevilNetLoss(nn.Module):
     """
 
     def __init__(self, signals: dict, weights: dict = None,
-                 temperature: float = 0.07, alpha: float = 1.0, beta: float = 1.0,
+                 temperature: float = 0.07, alpha: float = 0.1, beta: float = 1.0,
                  hard_neg_factor: float = 0.0):
         """
         hard_neg_factor : if > 0, dynamically upweights negatives the model already
@@ -312,7 +312,7 @@ class DevilNetLoss(nn.Module):
         devil_sim  = self.sim(z, self.devil_emb[idx])  # (B,)
 
         loss = torch.zeros(len(idx), device=z.device)
-        loss[TT]  = -w['w1'] * angel_sim[TT]
+        loss[TT]  = 0 #-w['w1'] * angel_sim[TT]
         loss[TF]  = -w['w2'] * angel_sim[TF] + w['w3'] * devil_sim[TF]
         loss[FF]  =  w['w4'] * devil_sim[FF]
         loss[FT]  =  w['w5'] * devil_sim[FT]   # conservative — devil correct but on seen data
