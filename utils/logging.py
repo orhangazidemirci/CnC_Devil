@@ -132,7 +132,7 @@ class Logger(object):
             if dir_path:
                 os.makedirs(dir_path, exist_ok=True)
             
-            self.file = open(fpath, mode)
+            self.file = open(fpath, mode, encoding='utf-8')
     def __del__(self):
         self.close()
 

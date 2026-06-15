@@ -44,7 +44,6 @@ def get_targets_all(dataset):
     if hasattr(dataset, 'dataset'):  # Subset
         return dataset.dataset.targets_all
     return dataset.targets_all
-
     
 def compute_devil_net_signals(bias_models, dataloader, data_idx, args):
     # Get targets aligned with what the dataloader actually sees
@@ -108,8 +107,6 @@ def compute_devil_net_signals(bias_models, dataloader, data_idx, args):
         'devil_embeddings':  devil_embeddings.astype(np.float32),
         'targets':           targets.astype(np.int64),
     }
-
-
 
 def run_tests(N_MODELS=4, N_SAMPLES=80, N_CLASSES=4, INPUT_DIM=16, EMBED_DIM=32):
     print(f"\n{'='*60}")

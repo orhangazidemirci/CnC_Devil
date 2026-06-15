@@ -9,6 +9,7 @@ import copy
 import argparse
 import torch.nn as nn
 
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -29,6 +30,7 @@ from network import get_net, get_optim, load_pretrained_model
 from contrastive_network import DEFAULT_WEIGHTS, ContrastiveNet, load_encoder_state_dict
 from contrastive_network import DevilNetLoss
 from slice import train_spurious_model
+from diagnose_signals import diagnose_devil_net_signals
 # Alternative slicing by UMAP clustering
 from slice_rep import compute_devil_net_signals
 
@@ -114,18 +116,25 @@ def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
     pbar   = tqdm(train_loader, desc=f'Epoch {epoch}')
 
     for batch in pbar:
-        inputs, labels, indices = batch
+        if args.devil:
+            inputs, labels, indices = batch
+        else:
+            inputs, labels = batch[0], batch[1]
+            indices = None
         inputs  = inputs.to(args.device)
         labels  = labels.to(args.device)
-        indices = indices.to(args.device)
 
         optimizer.zero_grad()
 
         embeddings, logits = model(inputs)
         ce_loss            = F.cross_entropy(logits, labels)
-        contrastive_loss, self_loss, batch_loss = loss_fn(indices, embeddings)
+        
+        if args.devil:
+            contrastive_loss, self_loss, batch_loss = loss_fn(indices, embeddings)
 
-        total_loss = ce_loss + contrastive_loss
+            total_loss = ce_loss + contrastive_loss
+        else:
+            total_loss = ce_loss
         total_loss.backward()
 
         if getattr(args, 'clip_grad_norm', False):
@@ -134,9 +143,11 @@ def train_epoch(model, train_loader, loss_fn, optimizer, args, epoch):
         optimizer.step()
 
         losses['total'].append(total_loss.item())
-        losses['ce'].append(ce_loss.item())
-        losses['self'].append(self_loss.item())
-        losses['batch'].append(batch_loss.item())
+        
+        if args.devil:
+            losses['ce'].append(ce_loss.item())
+            losses['self'].append(self_loss.item())
+            losses['batch'].append(batch_loss.item())
         pbar.set_postfix({k: f'{np.mean(v):.4f}' for k, v in losses.items()})
 
     return {k: np.mean(v) for k, v in losses.items()}
@@ -190,6 +201,52 @@ def train_devil_net(model, erm_models, train_loader, loss_fn,
 
     return best_model_state, history
 
+def train_baseline(model, erm_models, train_loader, loss_fn,
+                    val_loader, test_loader,
+                    optimizer, scheduler, args,
+                    group_labels_val=None, group_labels_test=None):
+
+    if args.train_encoder is not True:
+        return None, []
+
+
+    torch.cuda.empty_cache()
+
+    print_header('Baseline: Training')
+    history, best_val_acc, best_model_state = [], -1.0, None
+
+    for epoch in range(1, args.max_epoch + 1):
+        train_losses = train_epoch(model, train_loader, loss_fn,
+                                   optimizer, args, epoch)
+        val_results  = evaluate(model, val_loader, args,
+                                group_labels=group_labels_val)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        history.append({'epoch': epoch, **train_losses,
+                        **{f'val_{k}': v for k, v in val_results.items()}})
+        log_epoch(epoch, train_losses, val_results)
+
+        monitor = val_results.get('worst_group', val_results['avg_acc'])
+        if monitor > best_val_acc:
+            best_val_acc     = monitor
+            best_model_state = {k: v.cpu().clone()
+                                for k, v in model.state_dict().items()}
+
+    print_header('Baseline: Test evaluation')
+    model.load_state_dict({k: v.to(args.device)
+                           for k, v in best_model_state.items()})
+    test_results = evaluate(model, test_loader, args,
+                            group_labels=group_labels_test)
+
+    print(f'Test avg accuracy:   {test_results["avg_acc"]*100:.2f}%')
+    if 'worst_group' in test_results:
+        print(f'Test worst-group:    {test_results["worst_group"]*100:.2f}%')
+        for g, acc in test_results['group_accs'].items():
+            print(f'  Group {g}: {acc*100:.2f}%')
+
+    return best_model_state, history
 # ---------------------------------------------------------------------------
 # Step 3 — evaluate
 # Returns average accuracy and worst-group accuracy
@@ -324,7 +381,7 @@ def main():
  # -------------------------------------------------------------------------
     # Devil-NET
     # -------------------------------------------------------------------------
-    parser.add_argument('--devil', action='store_true', default=True,
+    parser.add_argument('--devil', action='store_true', default=False,
                         help='Partition training data into N shards, train one bias model per shard')
     parser.add_argument('--num_bias_models', type=int, default=5,
                         help='Number of shard partitions / bias models')
@@ -383,10 +440,10 @@ def main():
     # -------------------------------------------------------------------------
     parser.add_argument('--optim', type=str, default='adam',
                         choices=['AdamW', 'adam', 'sgd'])
-    parser.add_argument('--max_epoch', type=int, default=10)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--max_epoch', type=int, default=30)
+    parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-1)
     parser.add_argument('--weight_decay_c', type=float, default=-1,
                         help='Classifier weight decay (-1 = same as --weight_decay)')
     parser.add_argument('--stopping_window', type=int, default=30)
@@ -398,17 +455,18 @@ def main():
     # -------------------------------------------------------------------------
     # Bias model (stage 1) training
     # -------------------------------------------------------------------------
-    parser.add_argument('--pretrained_spurious_path', default='true', type=str,
+    parser.add_argument('--pretrained_spurious_path', default='', type=str,
                         help='Path to pretrained bias models (skips stage 1 if set)')
-    parser.add_argument('--max_epoch_s', type=int, default=1,
+    parser.add_argument('--max_epoch_s', type=int, default=10,
                         help='Epochs to train each bias model')
-    parser.add_argument('--bs_trn_s', type=int, default=32,
+    parser.add_argument('--bs_trn_s', type=int, default=128,
                         help='Batch size for bias model training')
-    parser.add_argument('--lr_s', type=float, default=1e-3,
+    parser.add_argument('--lr_s', type=float, default=1e-4,
                         help='Learning rate for bias models')
     parser.add_argument('--momentum_s', type=float, default=0.9)
     parser.add_argument('--weight_decay_s', type=float, default=5e-4)
-
+    parser.add_argument('--new_partition', default=False, action='store_true',
+                        help='Force recompute partition indices, ignoring cache')
     # -------------------------------------------------------------------------
     # Baselines
     # -------------------------------------------------------------------------
@@ -486,22 +544,39 @@ def main():
     train_loaders, val_loader, test_loader, visualize_dataset = initialize_data(args)
         # train_loaders is a list of N loaders, one per bias model partition
 
-    log_partition_bias(train_loaders)
+    if args.devil:
+        log_partition_bias(train_loaders)
 
     # Extract group labels for worst-group evaluation
     # These come from the dataset's metadata_array — column 0 is the group id
     # Works for Waterbirds, CelebA, CivilComments, CXR (all bias benchmarks)
+    # def get_group_labels(loader):
+    #     dataset = loader.dataset
+    #     # Unwrap Subset if needed
+    #     if hasattr(dataset, 'dataset'):
+    #         dataset = dataset.dataset
+    #     if hasattr(dataset, 'metadata_array'):
+    #         return dataset.metadata_array[:, 0].numpy().astype(np.int64)
+    #     elif hasattr(dataset, '_metadata_array'):
+    #         return dataset._metadata_array[:, 0].numpy().astype(np.int64)
+    #     else:
+    #         return None   # standard dataset — no group labels, evaluate() falls back to avg_acc
+    
     def get_group_labels(loader):
         dataset = loader.dataset
-        # Unwrap Subset if needed
-        if hasattr(dataset, 'dataset'):
-            dataset = dataset.dataset
+        if hasattr(dataset, 'indices'):   # it's a Subset
+            parent = dataset.dataset
+            if hasattr(parent, 'metadata_array'):
+                return parent.metadata_array[dataset.indices, 0].numpy().astype(np.int64)
+            elif hasattr(parent, '_metadata_array'):
+                return parent._metadata_array[dataset.indices, 0].numpy().astype(np.int64)
+            return None
+        # not a Subset — access directly
         if hasattr(dataset, 'metadata_array'):
             return dataset.metadata_array[:, 0].numpy().astype(np.int64)
         elif hasattr(dataset, '_metadata_array'):
             return dataset._metadata_array[:, 0].numpy().astype(np.int64)
-        else:
-            return None   # standard dataset — no group labels, evaluate() falls back to avg_acc
+        return None
     
     group_labels_val  = get_group_labels(val_loader)
     group_labels_test = get_group_labels(test_loader)
@@ -519,8 +594,10 @@ def main():
                                   shuffle=False,
                                   num_workers=args.num_workers)
     if args.dataset != 'civilcomments':
-        log_data(train_loaders[0].dataset.dataset, 'Train dataset:')  # Subset → Waterbirds
-   
+        if args.devil:
+            log_data(train_loaders[0].dataset.dataset, 'Train dataset:')  # Subset → Waterbirds
+        else:
+            log_data(train_loaders.dataset, 'Train dataset:')  # DataLoader → Waterbirds directly
         log_data(val_loader.dataset, 'Val dataset:')
         log_data(test_loader.dataset, 'Test dataset:')
     if args.evaluate is True:
@@ -593,67 +670,101 @@ def main():
     # -------------------
     # Slice training data
     # -------------------
-    if args.pretrained_spurious_path != '':
-        print_header('> Loading spurious model')
-        erm_models = []
-        for i in range(args.num_bias_models):
-            print(f'Partition {i}:')
-            fpath = os.path.join(args.bias_model_path, f"bias_model_{i}_best.pth")
-            os.makedirs(os.path.dirname(fpath), exist_ok=True)
-
-            partition_erm_models = load_pretrained_model(fpath,
-                                                        args)
-            partition_erm_models.eval()
-            erm_models.append(partition_erm_models)  
-        print(f'Pretrained model loaded from {args.bias_model_path}')
-        args.mode = 'train_spurious'
+    if args.devil is False:
+        print('Devil-NET disabled — skipping bias model training and slicing')
     else:
-        args.mode = 'train_spurious'
-        print_header('> Training spurious model')
-        args.spurious_train_split = 0.99
-        erm_models, outputs, _ = train_spurious_model(train_loaders, args)
-    
-    for i in range(args.num_bias_models):
-        erm_models[i].eval()
+        if args.pretrained_spurious_path != '':
+            print_header('> Loading spurious model')
+            erm_models = []
+            for i in range(args.num_bias_models):
+                print(f'Partition {i}:')
+                fpath = os.path.join(args.bias_model_path, f"bias_model_{i}_best.pth")
+                os.makedirs(os.path.dirname(fpath), exist_ok=True)
+
+                partition_erm_models = load_pretrained_model(fpath,
+                                                            args)
+                partition_erm_models.eval()
+                erm_models.append(partition_erm_models)  
+            print(f'Pretrained model loaded from {args.bias_model_path}')
+            args.mode = 'train_spurious'
+        else:
+            args.mode = 'train_spurious'
+            print_header('> Training spurious model')
+            args.spurious_train_split = 0.99
+            # erm_models, outputs, _ = train_spurious_model(train_loaders, args)
+            erm_models, outputs, _  = train_spurious_model(train_loaders, val_loader, args)
+
+        for i in range(args.num_bias_models):
+            erm_models[i].eval()
     
 
     if args.train_encoder is True:
+        print_header('> Training main model')
+        if args.devil is True:
 
-        sliced_outputs, train_loader, loss_fn = compute_slice_outputs(
-            erm_models, train_loaders, args)
+            sliced_outputs, train_loader, loss_fn = compute_slice_outputs(
+                erm_models, train_loaders, args)
+            diagnose_devil_net_signals(erm_models, train_loaders, sliced_outputs,
+                                    train_loader, loss_fn, args)
+            
+            log_devil_signals(sliced_outputs)
 
-        log_devil_signals(sliced_outputs)
+            # debug index alignment
+            batch = next(iter(train_loader))
+            _, _, idx = batch
+            print(f'Batch indices range: {idx.min().item()} - {idx.max().item()}')
+            print(f'sliced_outputs size: {loss_fn.targets.shape[0]}')
 
-        # debug index alignment
-        batch = next(iter(train_loader))
-        _, _, idx = batch
-        print(f'Batch indices range: {idx.min().item()} - {idx.max().item()}')
-        print(f'sliced_outputs size: {loss_fn.targets.shape[0]}')
+            for i in range(args.num_bias_models):
+                erm_models[i].to(torch.device('cpu'))
+            torch.cuda.empty_cache()
+            
+            torch.manual_seed(args.seed)
+            np.random.seed(args.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.seed)
 
-        for i in range(args.num_bias_models):
-            erm_models[i].to(torch.device('cpu'))
-        torch.cuda.empty_cache()
+            net = get_net(args)
+            net = DevilNetModel(net)
+            net.to(args.device)
 
-        net = get_net(args)
-        net = DevilNetModel(net)
-        net.to(args.device)
+            optimizer = get_optim(net, args, model_type='main')
 
-        optimizer = get_optim(net, args, model_type='main')
+            best_state, history = train_devil_net(
+                model=net,
+                erm_models=erm_models,
+                train_loader=train_loader,      # single combined loader, not slice_outputs
+                loss_fn=loss_fn,                
+                val_loader=val_loader,
+                test_loader=test_loader,
+                optimizer=optimizer,
+                scheduler=None,
+                args=args,
+                group_labels_val=group_labels_val,
+                group_labels_test=group_labels_test,
+            )
+        else:
+    
+            net = get_net(args)
+            net = DevilNetModel(net)
+            net.to(args.device)
 
-        best_state, history = train_devil_net(
-            model=net,
-            erm_models=erm_models,
-            train_loader=train_loader,      # ← single combined loader, not slice_outputs
-            loss_fn=loss_fn,                # ← pass directly, not inside train_loaders
-            val_loader=val_loader,
-            test_loader=test_loader,
-            optimizer=optimizer,
-            scheduler=None,
-            args=args,
-            group_labels_val=group_labels_val,
-            group_labels_test=group_labels_test,
-        )
- 
+            optimizer = get_optim(net, args, model_type='main')
+            print_header('Baseline: Training')
+            best_state, history = train_baseline(
+                model=net,
+                erm_models=net,
+                train_loader=train_loaders,      # single combined loader, not slice_outputs
+                loss_fn=None,             # standard CE loss only
+                val_loader=val_loader,
+                test_loader=test_loader,
+                optimizer=optimizer,
+                scheduler=None,
+                args=args,
+                group_labels_val=group_labels_val,
+                group_labels_test=group_labels_test,
+            )
+
 if __name__ == '__main__':
     main()
  

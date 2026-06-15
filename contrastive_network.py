@@ -266,21 +266,20 @@ class DevilNetLoss(nn.Module):
         self.devil_emb = F.normalize(
             torch.from_numpy(signals['devil_embeddings'].astype(np.float32)), dim=1)
 
-        self._on_device = False
-
     # ------------------------------------------------------------------
     # Device management
     # ------------------------------------------------------------------
 
+
     def _to_device(self, device):
-        if not self._on_device:
+        # Check actual device rather than a flag — handles CPU->GPU transition
+        # that happens between diagnostics (CPU) and training (GPU)
+        if self.angel_pred.device != device:
             self.angel_pred = self.angel_pred.to(device)
             self.devil_pred = self.devil_pred.to(device)
             self.targets    = self.targets.to(device)
             self.angel_emb  = self.angel_emb.to(device)
             self.devil_emb  = self.devil_emb.to(device)
-            self._on_device = True
-
     # ------------------------------------------------------------------
     # Table 1 — self loss
     # Mirrors compute_exp_sim but for self-alignment:
@@ -382,34 +381,37 @@ class DevilNetLoss(nn.Module):
 
         pos_w, neg_w = self._pair_weights(idx)   # (B, B)
 
-        # Similarity matrices — mirrors compute_exp_sim
-        #   sim_pos[i, j] = sim(z_i, z_angel_j)  — anchor vs Angel of partner
-        #   sim_neg[i, j] = sim(z_i, z_devil_j)  — anchor vs Devil of partner
-        z_angel_batch = self.angel_emb[idx]   # (B, D)
-        z_devil_batch = self.devil_emb[idx]   # (B, D)
+        # # Similarity matrices — mirrors compute_exp_sim
+        # #   sim_pos[i, j] = sim(z_i, z_angel_j)  — anchor vs Angel of partner
+        # #   sim_neg[i, j] = sim(z_i, z_devil_j)  — anchor vs Devil of partner
+        # z_angel_batch = self.angel_emb[idx]   # (B, D)
+        # z_devil_batch = self.devil_emb[idx]   # (B, D)
 
-        sim_pos = torch.mm(z, z_angel_batch.t()) / self.tau   # (B, B)
-        sim_neg = torch.mm(z, z_devil_batch.t()) / self.tau   # (B, B)
+        # sim_pos = torch.mm(z, z_angel_batch.t()) / self.tau   # (B, B)
+        # sim_neg = torch.mm(z, z_devil_batch.t()) / self.tau   # (B, B)
+
+
+        sim_pos = torch.mm(z, z.t()) / self.tau   # (B, B) — anchor vs partner's own embedding
+        sim_neg = torch.mm(z, z.t()) / self.tau   # same matrix, weights determine sign
+
 
         exp_pos = torch.exp(sim_pos)   # (B, B)
         exp_neg = torch.exp(sim_neg)   # (B, B)
 
-        # Weighted sums per anchor row
-        sum_exp_pos = (pos_w * exp_pos).sum(dim=1)   # (B,)
+        sim = torch.mm(z, z.t()) / self.tau   # (B, B)
+        exp = torch.exp(sim)                   # (B, B)
 
-        # Optional dynamic hard negative reweighting (flag: hard_neg_factor > 0)
-        # Upweights negatives the model already finds similar — most confused pairs
-        # contribute more to the denominator, sharpening the repulsion signal.
-        # Mirrors CnC's hard_negative_factor logic: reweight = k * exp_neg / mean(exp_neg)
+        # Weighted sums per anchor row
+        sum_exp_pos = (pos_w * exp).sum(dim=1)   # (B,)
+
         if self.hard_neg_factor > 0:
-            # Only reweight over actual negative positions (neg_w > 0)
-            neg_mask      = neg_w > 0                                      # (B, B)
-            mean_exp_neg  = (exp_neg * neg_mask).sum(dim=1, keepdim=True) \
-                            / neg_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1)
-            reweight      = self.hard_neg_factor * exp_neg / (mean_exp_neg + 1e-8)
-            sum_exp_neg   = (neg_w * reweight * exp_neg).sum(dim=1)        # (B,)
+            neg_mask     = neg_w > 0
+            mean_exp_neg = (exp * neg_mask).sum(dim=1, keepdim=True) \
+                           / neg_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            reweight     = self.hard_neg_factor * exp / (mean_exp_neg + 1e-8)
+            sum_exp_neg  = (neg_w * reweight * exp).sum(dim=1)
         else:
-            sum_exp_neg = (neg_w * exp_neg).sum(dim=1)                     # (B,)
+            sum_exp_neg = (neg_w * exp).sum(dim=1)
 
         # Only compute loss for anchors that have at least one positive and one negative
         valid = (sum_exp_pos > 0) & (sum_exp_neg > 0)
@@ -441,7 +443,7 @@ class DevilNetLoss(nn.Module):
             batch_loss : scalar
         """
         self._to_device(z_raw.device)
-
+        idx = idx.to(z_raw.device)
         z = F.normalize(z_raw, dim=1)   # (B, D) — normalize once, use everywhere
 
         self_loss  = self.compute_self_loss(idx, z)

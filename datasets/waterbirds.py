@@ -252,7 +252,7 @@ def get_resampled_set(dataset, resampled_set_indices, copy_dataset=False):
     - resampled_set_indices (int[]): List-like of indices 
     - deepcopy (bool): If true, copy the dataset
     """
-    resampled_set = copy.deepcopy(dataset) if copy_dataset else dataset
+    resampled_set = deepcopy(dataset) if copy_dataset else dataset
     resampled_set.y_array = resampled_set.y_array[resampled_set_indices]
     resampled_set.group_array = resampled_set.group_array[resampled_set_indices]
     resampled_set.filename_array = resampled_set.filename_array[resampled_set_indices]

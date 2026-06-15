@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import mode
+from activations import save_activations
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,11 @@ class DevilNetLoss(nn.Module):
         idx: (B,) dataset indices
         z:   (B, D) L2-normalized f_enc embeddings
         """
+
+        self._to_device(z.device)
+        w = self.w
+        angel_correct = self.angel_pred[idx] == self.targets[idx]
+
         w = self.w
         TT, TF, FF, FT = self._self_cases(idx)
 

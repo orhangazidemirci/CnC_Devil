@@ -140,7 +140,14 @@ def initialize_data(args):
 
     # --- Dataset-specific args ---
     if 'waterbirds' in args.dataset:
-        args.root_dir = 'C:/Users/Orhan/Documents/GitHub/CnC_Devil/datasets/data/Waterbirds/'
+        # args.root_dir = 'C:/Users/Orhan/Documents/GitHub/CnC_Devil/datasets/data/Waterbirds/'
+
+
+        
+        args.root_dir = getattr(args, 'root_dir', None)
+        if not args.root_dir or 'slice-and-dice' in args.root_dir:
+            args.root_dir = './datasets/data/Waterbirds/'
+
         args.target_name     = 'waterbird_complete95'
         args.confounder_names = ['forest2water2']
         args.image_mean      = np.mean([0.485, 0.456, 0.406])
@@ -209,7 +216,7 @@ def initialize_data(args):
 
     # Non-devil: wrap single loader in a list for consistent interface
     train_loader, val_loader, test_loader = load_dataloaders(args)
-    return [train_loader], val_loader, test_loader, visualize_dataset
+    return train_loader, val_loader, test_loader, visualize_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +236,15 @@ def _initialize_devil(args, load_dataloaders, visualize_dataset):
     """
     train_loader_full, val_loader, test_loader = load_dataloaders(args)
 
+
+
     indices_file = (f'{args.dataset}_devil_split'
                     f'_{args.num_bias_models}_seed{args.seed}.pkl')
+
+
+    if getattr(args, 'new_partition', False) and os.path.exists(indices_file):
+        os.remove(indices_file)
+        print(f'Deleted cached partition: {indices_file}')
 
     if os.path.exists(indices_file):
         print(f'Loading cached devil partition indices from {indices_file}')
@@ -294,30 +308,8 @@ def _random_partition(num_total_samples, num_bias_models, seed):
     np.random.shuffle(all_indices)
     return [arr.tolist() for arr in np.array_split(all_indices, num_bias_models)]
 
-
 def _stratified_partition_per_class_bias(dataset, num_bias_models,
                                           base_bias=0.95, seed=42):
-    """
-    Partition into N shards where each class has an OPPOSITE bias trajectory.
-
-    For 2 classes (e.g. Waterbirds):
-      Partition 0: class 0 bias HIGH (0.99),  class 1 bias LOW  (0.91)
-      Partition N//2: class 0 bias = class 1 bias = base_bias (0.95)
-      Partition N-1: class 0 bias LOW  (0.91), class 1 bias HIGH (0.99)
-
-    The average bias across all partitions = base_bias for every class,
-    because the offsets are symmetric and sum to zero.
-
-    Group layout assumed (Waterbirds / CelebA convention):
-      group 2c   = spurious group of class c   (majority)
-      group 2c+1 = conflicting group of class c (minority)
-
-    e.g. Waterbirds:
-      group 0: landbird  on land  (spurious  for class 0)
-      group 1: landbird  on water (conflicting for class 0)
-      group 2: waterbird on water (spurious  for class 1)
-      group 3: waterbird on land  (conflicting for class 1)
-    """
     np.random.seed(seed)
     N = num_bias_models
 
@@ -333,29 +325,56 @@ def _stratified_partition_per_class_bias(dataset, num_bias_models,
                     else np.array(metadata[:, 0]))
 
     num_groups  = len(np.unique(group_labels))
-    num_classes = num_groups // 2   # assumes 2 groups per class
+    num_classes = num_groups // 2
     group_counts = np.array([(group_labels == g).sum() for g in range(num_groups)])
     print(f'  Group counts: {group_counts.tolist()}')
-    print(f'  Num classes: {num_classes}  |  Groups per class: 2')
 
-    # Shuffle indices within each group
     group_indices = {}
     for g in range(num_groups):
         idx = np.where(group_labels == g)[0]
         np.random.shuffle(idx)
         group_indices[g] = idx.tolist()
 
-    # --- Per-class bias trajectories ---
-    # spread: maximum deviation from base_bias while keeping bias in [0.5, 1.0]
-    max_spread = min(base_bias - 0.5, 1.0 - base_bias)
-    offsets    = np.linspace(max_spread, -max_spread, N)  # +spread → -spread
+    # Step 1 — identify spurious (majority) and conflicting (minority) per class
+    class_spur_conf = {}
+    for c in range(num_classes):
+        g_a, g_b = 2 * c, 2 * c + 1
+        if len(group_indices[g_a]) >= len(group_indices[g_b]):
+            class_spur_conf[c] = (g_a, g_b)
+        else:
+            class_spur_conf[c] = (g_b, g_a)
+        spur_g, conf_g = class_spur_conf[c]
+        print(f'  Class {c}: spur=group{spur_g}(n={len(group_indices[spur_g])})  '
+              f'conf=group{conf_g}(n={len(group_indices[conf_g])})')
 
-    # class c gets direction = +1 if even, -1 if odd → opposite trajectories
-    # average over partitions: base_bias + direction * mean(offsets) = base_bias + 0 ✓
+    # Step 2 — compute per-class spread
+    per_class_max_spread = []
+    for c in range(num_classes):
+        spur_g, conf_g = class_spur_conf[c]
+        n_spur         = len(group_indices[spur_g])
+        n_conf         = len(group_indices[conf_g])
+        n_total_c      = n_spur + n_conf
+        n_per_part_c   = n_total_c // N
+
+        if n_conf < N:
+            spread = 0.0
+        else:
+            spread_from_range = min(base_bias - 0.5, 1.0 - base_bias)
+            spread_from_pool  = n_conf / n_per_part_c - (1.0 - base_bias)
+            spread = max(min(spread_from_range, spread_from_pool), 0.0)
+
+        per_class_max_spread.append(spread)
+        print(f'  Class {c}: n_spur={n_spur} n_conf={n_conf} spread={spread:.4f}')
+
+    # Step 3 — compute target biases per class per partition
+    offsets_base = np.linspace(1.0, -1.0, N)
     class_biases = np.zeros((num_classes, N))
     for c in range(num_classes):
         direction       = 1 if c % 2 == 0 else -1
-        class_biases[c] = np.clip(base_bias + direction * offsets, 0.5, 1.0)
+        class_biases[c] = np.clip(
+            base_bias + direction * per_class_max_spread[c] * offsets_base,
+            0.5, 1.0
+        )
 
     print(f'\n  Target bias per class per partition:')
     for c in range(num_classes):
@@ -364,34 +383,32 @@ def _stratified_partition_per_class_bias(dataset, num_bias_models,
 
     partitions = [[] for _ in range(N)]
 
-    # --- Per class: allocate samples across partitions ---
+    # Step 4 — allocate samples
     for c in range(num_classes):
-        spur_g = 2 * c
-        conf_g = 2 * c + 1
-
+        spur_g, conf_g = class_spur_conf[c]
         spur_pool = list(group_indices[spur_g])
         conf_pool = list(group_indices[conf_g])
-
-        n_total   = len(spur_pool) + len(conf_pool)
-        n_per_part = n_total // N   # base allocation per partition
+        n_total    = len(spur_pool) + len(conf_pool)
+        n_per_part = n_total // N
 
         # First pass: allocate n_per_part per partition at target bias
         for i in range(N):
             n_spur_i = min(int(round(class_biases[c][i] * n_per_part)), len(spur_pool))
             n_conf_i = min(n_per_part - n_spur_i, len(conf_pool))
-            # if conf ran short, take more spurious instead
-            n_spur_i = min(n_spur_i + max(0, (n_per_part - n_spur_i) - n_conf_i),
-                           len(spur_pool))
+            shortfall = (n_per_part - n_spur_i) - n_conf_i
+            if shortfall > 0:
+                n_spur_i = min(n_spur_i + shortfall, len(spur_pool))
 
             partitions[i].extend(spur_pool[:n_spur_i])
             partitions[i].extend(conf_pool[:n_conf_i])
             spur_pool = spur_pool[n_spur_i:]
             conf_pool = conf_pool[n_conf_i:]
 
-        # Second pass: distribute remaining proportionally by target bias
+        # Second pass: distribute remaining proportionally
         if spur_pool or conf_pool:
             spur_w = class_biases[c] / class_biases[c].sum()
-            conf_w = (1 - class_biases[c]) / (1 - class_biases[c]).sum()
+            conf_w = (1 - class_biases[c])
+            conf_w = conf_w / conf_w.sum() if conf_w.sum() > 0 else np.ones(N) / N
 
             spur_splits = np.round(spur_w * len(spur_pool)).astype(int)
             conf_splits = np.round(conf_w * len(conf_pool)).astype(int)
@@ -405,17 +422,18 @@ def _stratified_partition_per_class_bias(dataset, num_bias_models,
                 s += spur_splits[i]
                 k += conf_splits[i]
 
-    # Shuffle each partition and report actual bias achieved
+    # Shuffle and report
     print(f'\n  Actual bias per class per partition:')
     for i in range(N):
         np.random.shuffle(partitions[i])
         part_groups = group_labels[partitions[i]]
         row = []
         for c in range(num_classes):
-            n_s = (part_groups == 2 * c).sum()
-            n_c = (part_groups == 2 * c + 1).sum()
-            actual = n_s / (n_s + n_c) if (n_s + n_c) > 0 else 0
-            row.append(f'c{c}={actual:.2f}(t{class_biases[c][i]:.2f})')
+            spur_g, conf_g = class_spur_conf[c]
+            n_s    = (part_groups == spur_g).sum()
+            n_c    = (part_groups == conf_g).sum()
+            actual = n_s / (n_s + n_c) if (n_s + n_c) > 0 else 0.0
+            row.append(f'c{c}={actual:.2f}(t={class_biases[c][i]:.2f})')
         print(f'    Partition {i} [{len(partitions[i])} samples]: {" | ".join(row)}')
 
     return partitions

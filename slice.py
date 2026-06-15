@@ -21,18 +21,16 @@ def random_exclude(n, exclude):
     candidates = [i for i in range(n + 1) if i != exclude]
     return random.choice(candidates)
 
-def train_spurious_model(train_loaders, args, resample=False,
+def train_spurious_model(train_loaders, val_loader,args, resample=False,
                          return_loaders=False, test_loader=None,
                          test_criterion=None):
     
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    _, val_loader, test_loader, visualize_dataset = initialize_data(args)
-    del _
   
     net = get_net(args)
-    optim = get_optim(net, args, model_type='spurious')
+    # optim = get_optim(net, args, model_type='spurious')
     criterion = nn.CrossEntropyLoss(reduction='mean')
     
     log_test_results = True if test_loader is not None else False
@@ -56,7 +54,11 @@ def train_spurious_model(train_loaders, args, resample=False,
         
         bias_models.append(get_net(args).to(DEVICE))
 
-    
+    # for model_idx, model in enumerate(bias_models):
+    #     # Freeze all layers except the final FC
+    #     for name, param in model.named_parameters():
+    #         if 'fc' not in name and 'classifier' not in name:
+    #             param.requires_grad = False
     
     # --- 7. Training and Validation Loop ---
     from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -95,7 +97,7 @@ def train_spurious_model(train_loaders, args, resample=False,
                             test_criterion=test_criterion,
                             model_save_path=model_save_path,
                             model_idx=model_idx)
-    if return_loaders:
-        return bias_models, outputs, (train_loader_new, train_loader_spurious)
+    # if return_loaders:
+    #     return bias_models, outputs, (train_loader_new, train_loader_spurious)
     return bias_models, outputs, None
 

@@ -10,3 +10,5 @@
 waterbirds/
 model/
 *.pkl
+*.pth
+*.pth
